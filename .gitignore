@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+.idea/
+.vscode/
+
+.DS_Store
+Thumbs.db
+
+*.log
+
+# Large local 3D assets
+*.glb
+*.gltf
+*.bin
