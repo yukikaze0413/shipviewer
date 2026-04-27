@@ -41,18 +41,53 @@ class RemappedQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
         super().__init__(*args, **kwargs)
         self._wheel_delta_remainder = 0
 
-    def mousePressEvent(self, ev):
+    def _viewport_parent(self):
+        parent = self.parent()
+        return parent if parent is not None else None
+
+    def _set_interactor_event_info(self, ev, repeat=0):
         ctrl, shift = self._GetCtrlShift(ev)
-        repeat = 1 if ev.type() == EventType.MouseButtonDblClick else 0
         x, y = _get_event_pos(ev)
         self._setEventInformation(x, y, ctrl, shift, chr(0), repeat, None)
+        return x, y
+
+    def _dispatch_left_click_pick(self):
+        parent = self._viewport_parent()
+        if parent is not None and hasattr(parent, "_handle_viewport_left_click"):
+            parent._handle_viewport_left_click()
+
+    def _dispatch_wheel_step(self, direction):
+        parent = self._viewport_parent()
+        if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
+            parent._handle_viewport_wheel(direction)
+        elif direction > 0:
+            self._Iren.MouseWheelForwardEvent()
+        else:
+            self._Iren.MouseWheelBackwardEvent()
+
+    def _wheel_event_delta(self, ev):
+        angle_delta = ev.angleDelta().y() if hasattr(ev, "angleDelta") else 0
+        pixel_delta = ev.pixelDelta().y() if hasattr(ev, "pixelDelta") else 0
+        legacy_delta = ev.delta() if hasattr(ev, "delta") else 0
+        return angle_delta, pixel_delta, legacy_delta
+
+    def _consume_wheel_angle_delta(self):
+        while self._wheel_delta_remainder >= 120:
+            self._dispatch_wheel_step(1)
+            self._wheel_delta_remainder -= 120
+
+        while self._wheel_delta_remainder <= -120:
+            self._dispatch_wheel_step(-1)
+            self._wheel_delta_remainder += 120
+
+    def mousePressEvent(self, ev):
+        repeat = 1 if ev.type() == EventType.MouseButtonDblClick else 0
+        self._set_interactor_event_info(ev, repeat=repeat)
 
         self._ActiveButton = ev.button()
 
         if self._ActiveButton == MouseButton.LeftButton:
-            parent = self.parent()
-            if parent is not None and hasattr(parent, "_handle_viewport_left_click"):
-                parent._handle_viewport_left_click()
+            self._dispatch_left_click_pick()
             ev.accept()
             return
 
@@ -67,9 +102,7 @@ class RemappedQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
         super().mousePressEvent(ev)
 
     def mouseReleaseEvent(self, ev):
-        ctrl, shift = self._GetCtrlShift(ev)
-        x, y = _get_event_pos(ev)
-        self._setEventInformation(x, y, ctrl, shift, chr(0), 0, None)
+        self._set_interactor_event_info(ev)
 
         if self._ActiveButton == MouseButton.LeftButton:
             self._ActiveButton = MouseButton.NoButton
@@ -89,47 +122,17 @@ class RemappedQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
         super().mouseReleaseEvent(ev)
 
     def wheelEvent(self, ev):
-        ctrl, shift = self._GetCtrlShift(ev)
-        x, y = _get_event_pos(ev)
-        self._setEventInformation(x, y, ctrl, shift, chr(0), 0, None)
-
-        angle_delta = ev.angleDelta().y() if hasattr(ev, "angleDelta") else 0
-        pixel_delta = ev.pixelDelta().y() if hasattr(ev, "pixelDelta") else 0
-        legacy_delta = ev.delta() if hasattr(ev, "delta") else 0
-
-        parent = self.parent()
+        self._set_interactor_event_info(ev)
+        angle_delta, pixel_delta, legacy_delta = self._wheel_event_delta(ev)
 
         # 优先使用标准滚轮角度增量；若当前输入设备只提供像素级滚动，则直接按方向触发缩放。
         if angle_delta:
             self._wheel_delta_remainder += angle_delta
-
-            while self._wheel_delta_remainder >= 120:
-                if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
-                    parent._handle_viewport_wheel(1)
-                else:
-                    self._Iren.MouseWheelForwardEvent()
-                self._wheel_delta_remainder -= 120
-
-            while self._wheel_delta_remainder <= -120:
-                if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
-                    parent._handle_viewport_wheel(-1)
-                else:
-                    self._Iren.MouseWheelBackwardEvent()
-                self._wheel_delta_remainder += 120
+            self._consume_wheel_angle_delta()
         elif pixel_delta:
-            if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
-                parent._handle_viewport_wheel(1 if pixel_delta > 0 else -1)
-            elif pixel_delta > 0:
-                self._Iren.MouseWheelForwardEvent()
-            else:
-                self._Iren.MouseWheelBackwardEvent()
+            self._dispatch_wheel_step(1 if pixel_delta > 0 else -1)
         elif legacy_delta:
-            if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
-                parent._handle_viewport_wheel(1 if legacy_delta > 0 else -1)
-            elif legacy_delta > 0:
-                self._Iren.MouseWheelForwardEvent()
-            else:
-                self._Iren.MouseWheelBackwardEvent()
+            self._dispatch_wheel_step(1 if legacy_delta > 0 else -1)
 
         ev.accept()
 
@@ -318,6 +321,44 @@ class VTKWidget(QWidget):
     def _format_vector(self, vector):
         return f"({vector[0]:+.4f}, {vector[1]:+.4f}, {vector[2]:+.4f})"
 
+    def _camera_debug_values(self, camera):
+        position = camera.GetPosition()
+        focal_point = camera.GetFocalPoint()
+        center_to_camera = self._normalize_vector(
+            (
+                position[0] - focal_point[0],
+                position[1] - focal_point[1],
+                position[2] - focal_point[2],
+            )
+        )
+        projection_direction = self._normalize_vector(camera.GetDirectionOfProjection())
+        view_up = self._normalize_vector(camera.GetViewUp())
+        distance = camera.GetDistance()
+        roll = camera.GetRoll()
+
+        return {
+            "position": position,
+            "focal_point": focal_point,
+            "center_to_camera": center_to_camera,
+            "projection_direction": projection_direction,
+            "view_up": view_up,
+            "distance": distance,
+            "roll": roll,
+        }
+
+    def _camera_debug_text(self, camera):
+        values = self._camera_debug_values(camera)
+        return (
+            "相机调试\n"
+            f"position: {self._format_vector(values['position'])}\n"
+            f"focal_point: {self._format_vector(values['focal_point'])}\n"
+            f"direction (center→camera): {self._format_vector(values['center_to_camera'])}\n"
+            f"dop (camera→center): {self._format_vector(values['projection_direction'])}\n"
+            f"view_up (screen↑): {self._format_vector(values['view_up'])}\n"
+            f"distance: {values['distance']:.4f}\n"
+            f"roll: {values['roll']:.4f}°"
+        )
+
     def _update_camera_debug_overlay(self):
         if (
             not self._camera_debug_overlay_visible
@@ -333,25 +374,9 @@ class VTKWidget(QWidget):
             )
             return
 
-        position = camera.GetPosition()
-        focal_point = camera.GetFocalPoint()
-        direction = self._normalize_vector(
-            (
-                position[0] - focal_point[0],
-                position[1] - focal_point[1],
-                position[2] - focal_point[2],
-            )
-        )
-        view_up = self._normalize_vector(camera.GetViewUp())
-
-        debug_text = (
-            "相机调试\n"
-            f"direction (center→camera): {self._format_vector(direction)}\n"
-            f"view_up (screen↑): {self._format_vector(view_up)}"
-        )
         self._camera_debug_annotation.SetText(
             vtk.vtkCornerAnnotation.UpperRight,
-            debug_text,
+            self._camera_debug_text(camera),
         )
 
     def set_camera_debug_overlay_visible(self, visible=True):
@@ -412,41 +437,60 @@ class VTKWidget(QWidget):
         self.grid_actor.GetProperty().SetOpacity(0.2)
         self.renderer.AddActor(self.grid_actor)
 
-    def _handle_viewport_left_click(self):
+    def _current_interactor_event_position(self):
+        return self.interactor.GetEventPosition()
+
+    def _pick_actor_name_at_event_position(self):
         # 取 VTK 交互器中的显示坐标，而不是直接使用 Qt 原始鼠标坐标。
         # 新方案在桥接层已经通过 _setEventInformation() 做过像素比缩放与 Y 轴翻转；
         # 若这里继续拿 Qt 坐标去 Pick，会导致拾取射线起点落在错误的屏幕位置。
-        click_pos = self.interactor.GetEventPosition()
+        click_pos = self._current_interactor_event_position()
         self.picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
         actor = self.picker.GetActor()
-        clicked_name = ""
         if actor:
-            for name, a in self._actors.items():
-                if a == actor:
-                    clicked_name = self._selection_name_for_pick(name)
-                    break
+            for name, mapped_actor in self._actors.items():
+                if mapped_actor == actor:
+                    return self._selection_name_for_pick(name)
+        return ""
+
+    def _emit_model_clicked(self, clicked_name):
         self.model_clicked.emit(clicked_name)
+
+    def _handle_viewport_left_click(self):
+        self._emit_model_clicked(self._pick_actor_name_at_event_position())
+
+    def _zoom_factor(self):
+        return 1.2
+
+    def _zoom_parallel_camera(self, camera, direction, zoom_factor):
+        scale = camera.GetParallelScale()
+        if direction > 0:
+            camera.SetParallelScale(max(scale / zoom_factor, 1e-6))
+        else:
+            camera.SetParallelScale(scale * zoom_factor)
+
+    def _zoom_perspective_camera(self, camera, direction, zoom_factor):
+        if direction > 0:
+            camera.Dolly(zoom_factor)
+        else:
+            camera.Dolly(1.0 / zoom_factor)
+
+    def _finalize_camera_zoom(self):
+        self.renderer.ResetCameraClippingRange()
+        self.render_window.Render()
 
     def _handle_viewport_wheel(self, direction):
         camera = self.renderer.GetActiveCamera()
         if camera is None:
             return
 
-        zoom_factor = 1.2
+        zoom_factor = self._zoom_factor()
         if camera.GetParallelProjection():
-            scale = camera.GetParallelScale()
-            if direction > 0:
-                camera.SetParallelScale(max(scale / zoom_factor, 1e-6))
-            else:
-                camera.SetParallelScale(scale * zoom_factor)
+            self._zoom_parallel_camera(camera, direction, zoom_factor)
         else:
-            if direction > 0:
-                camera.Dolly(zoom_factor)
-            else:
-                camera.Dolly(1.0 / zoom_factor)
+            self._zoom_perspective_camera(camera, direction, zoom_factor)
 
-        self.renderer.ResetCameraClippingRange()
-        self.render_window.Render()
+        self._finalize_camera_zoom()
 
     def _on_left_button_press(self, obj, event):
         # 旧方案保留：如果未来重新启用 VTK 左键事件拾取，可继续复用该入口。
@@ -703,23 +747,35 @@ class VTKWidget(QWidget):
     def highlighted_names(self):
         return list(self._selected_actor_names)
 
-    def reset_camera(self):
-        self._reset_camera_to_direction((1.0, 1.0, 1.0), (0.0, 1.0, 0.0))
+    def _camera_pose_iso(self):
+        return (1.0, 1.0, 1.0), (0.0, 1.0, 0.0)
+
+    def _camera_pose_front(self):
+        return (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)
+
+    def _camera_pose_top(self):
+        # 近俯视：主方向沿世界 Y 轴，并保留极小 Z 偏移以维持 Y-up 的可观察投影。
+        # 这不是严格 0 度正俯视，而是为避免 Y 轴与视线完全共线而采用的稳定近似值。
+        return (0.0, 0.9998, 0.0209), (0.0, 1.0, 0.0)
+
+    def _camera_pose_right(self):
+        return (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+
+    def _apply_camera_pose(self, direction, view_up):
+        self._reset_camera_to_direction(direction, view_up)
         self.render_window.Render()
+
+    def reset_camera(self):
+        self._apply_camera_pose(*self._camera_pose_iso())
 
     def set_view_front(self):
-        self._reset_camera_to_direction((0.0, 0.0, 1.0), (0.0, 1.0, 0.0))
-        self.render_window.Render()
+        self._apply_camera_pose(*self._camera_pose_front())
 
     def set_view_top(self):
-        # 严格 0 度俯视：视线沿世界 Y 轴，去掉之前的小角度倾斜。
-        # 这会保持俯视方向稳定，避免按钮切换时出现额外滚转。
-        self._reset_camera_to_direction((0.0, 0.9998, 0.0209), (0.0, 1.0, 0.0))
-        self.render_window.Render()
+        self._apply_camera_pose(*self._camera_pose_top())
 
     def set_view_right(self):
-        self._reset_camera_to_direction((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
-        self.render_window.Render()
+        self._apply_camera_pose(*self._camera_pose_right())
 
     def set_view_iso(self):
         self.reset_camera()
@@ -747,7 +803,9 @@ class VTKWidget(QWidget):
             center[2] + direction[2] * distance,
         )
         camera.SetViewUp(*view_up)
-        # camera.OrthogonalizeViewUp()
+        # 注意：这里暂时不调用 camera.OrthogonalizeViewUp()。
+        # 原因是当前俯视调参阶段需要保留传入的原始 view_up 语义，便于通过调试框观察输入效果；
+        # 若启用正交化，VTK 会把 view_up 投影到与视线垂直的平面上，导致观测值被几何修正。
         camera.SetRoll(0.0)
         self.renderer.ResetCameraClippingRange(bounds)
         if camera.GetParallelProjection():

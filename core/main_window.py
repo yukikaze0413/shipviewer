@@ -208,9 +208,7 @@ class MainWindow(QMainWindow):
         self.action_camera_debug = QAction("显示相机调试框", self)
         self.action_camera_debug.setCheckable(True)
         self.action_camera_debug.setChecked(False)
-        self.action_camera_debug.toggled.connect(
-            self.vtk_widget.toggle_camera_debug_overlay
-        )
+        self.action_camera_debug.toggled.connect(self._set_camera_debug_overlay_visible)
         view_menu.addAction(self.action_camera_debug)
 
         # === 窗口菜单 ===
@@ -283,13 +281,11 @@ class MainWindow(QMainWindow):
         self.btn_wireframe.toggled.connect(self._toggle_wireframe)
         toolbar.addAction(self.btn_wireframe)
 
-        btn_camera_debug = QAction("🧭 调试", self)
-        btn_camera_debug.setCheckable(True)
-        btn_camera_debug.setToolTip("显示相机 direction / view_up 调试框")
-        btn_camera_debug.toggled.connect(self.vtk_widget.toggle_camera_debug_overlay)
-        btn_camera_debug.toggled.connect(self.action_camera_debug.setChecked)
-        self.action_camera_debug.toggled.connect(btn_camera_debug.setChecked)
-        toolbar.addAction(btn_camera_debug)
+        self.btn_camera_debug = QAction("🧭 调试", self)
+        self.btn_camera_debug.setCheckable(True)
+        self.btn_camera_debug.setToolTip("显示相机 direction / view_up 调试框")
+        self.btn_camera_debug.toggled.connect(self._set_camera_debug_overlay_visible)
+        toolbar.addAction(self.btn_camera_debug)
 
         toolbar.addSeparator()
 
@@ -1653,6 +1649,17 @@ class MainWindow(QMainWindow):
         self.btn_wireframe.blockSignals(False)
         if hasattr(self, "chk_wireframe"):
             self.chk_wireframe.blockSignals(False)
+
+    def _set_camera_debug_overlay_visible(self, checked):
+        """统一同步菜单、工具栏与 VTK 调试框状态。"""
+        self.vtk_widget.set_camera_debug_overlay_visible(checked)
+
+        self.action_camera_debug.blockSignals(True)
+        self.btn_camera_debug.blockSignals(True)
+        self.action_camera_debug.setChecked(checked)
+        self.btn_camera_debug.setChecked(checked)
+        self.action_camera_debug.blockSignals(False)
+        self.btn_camera_debug.blockSignals(False)
 
     def _actor_has_any_texture(self, actor):
         if actor is None:
