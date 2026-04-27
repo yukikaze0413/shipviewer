@@ -3,8 +3,10 @@
 管理菜单、工具栏、停靠面板和3D视口
 """
 import csv
+import json
 import os
-import sys
+import re
+import struct
 from collections import defaultdict
 import vtk
 
@@ -13,15 +15,28 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem,
     QToolBar, QStatusBar, QFileDialog, QMessageBox,
     QProgressBar, QLabel, QVBoxLayout, QHBoxLayout,
-    QWidget, QMenu, QMenuBar, QSplitter, QTabWidget,
-    QGroupBox, QCheckBox, QComboBox, QPushButton, QAbstractItemView,
-    QFrame, QSizePolicy, QApplication
+    QWidget, QMenu, QMenuBar, QStackedWidget,
+    QGroupBox, QPushButton, QAbstractItemView,
 )
-from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QFont, QColor
+from PySide6.QtCore import Qt, QSize, QTimer, QUrl
+from PySide6.QtGui import QAction, QKeySequence, QDesktopServices
+
+try:
+    from PySide6.QtWebEngineCore import QWebEngineSettings
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+except ImportError:
+    QWebEngineSettings = None
+    QWebEngineView = None
+
+try:
+    from PySide6.QtPdf import QPdfDocument
+    from PySide6.QtPdfWidgets import QPdfView
+except ImportError:
+    QPdfDocument = None
+    QPdfView = None
 
 from core.vtk_widget import VTKWidget
-from core.model_loader import ModelLoadThread, get_supported_formats, get_file_info
+from core.model_loader import ModelLoadThread, get_supported_formats
 
 
 class MainWindow(QMainWindow):
@@ -42,10 +57,22 @@ class MainWindow(QMainWindow):
         self._gltf_importer = None
         self._loaded_items = []
         self._is_wireframe = False
-        self._damage_tree_csv_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "damage-tree-nodes.csv",
+        self._project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._damage_tree_csv_path = os.path.join(self._project_root, "damage-tree-nodes.csv")
+        self._pdf_catalog_csv_path = os.path.join(self._project_root, "part-pdf-catalog.csv")
+        self._viewport_background_path = os.path.join(
+            self._project_root,
+            "assets",
+            "backgrounds",
+            "citrus_orchard_puresky_4k.hdr",
         )
+        self._pdf_catalog_rows = []
+        self._pdf_catalog_by_model_name = defaultdict(list)
+        self._pdf_catalog_by_damage_leaf_id = defaultdict(list)
+        self._current_catalog_matches = []
+        self._current_document_path = None
+        self._actor_catalog_names = {}
+        self._actor_display_names = {}
 
         # 构建界面
         self._create_vtk_viewport()
@@ -54,6 +81,7 @@ class MainWindow(QMainWindow):
         self._create_model_tree_dock()
         self._create_properties_dock()
         self._create_status_bar()
+        self._load_pdf_catalog_from_csv()
         self._load_damage_tree_from_csv()
 
         # 信号连接
@@ -161,7 +189,7 @@ class MainWindow(QMainWindow):
         self.action_show_tree.setChecked(True)
         window_menu.addAction(self.action_show_tree)
 
-        self.action_show_props = QAction("属性面板", self)
+        self.action_show_props = QAction("信息展示", self)
         self.action_show_props.setCheckable(True)
         self.action_show_props.setChecked(True)
         window_menu.addAction(self.action_show_props)
@@ -171,6 +199,8 @@ class MainWindow(QMainWindow):
         action_about = QAction("关于(&A)...", self)
         action_about.triggered.connect(self._show_about)
         help_menu.addAction(action_about)
+
+        menubar.hide()
 
     def _create_toolbar(self):
         """创建工具栏"""
@@ -279,61 +309,71 @@ class MainWindow(QMainWindow):
         self.tree_dock.visibilityChanged.connect(self.action_show_tree.setChecked)
 
     def _create_properties_dock(self):
-        """创建属性面板停靠窗口"""
-        self.props_dock = QDockWidget("属性", self)
-        self.props_dock.setMinimumWidth(260)
+        """创建信息展示停靠窗口"""
+        self.props_dock = QDockWidget("信息展示", self)
+        self.props_dock.setMinimumWidth(420)
         self.props_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable
         )
 
         props_container = QWidget()
         props_layout = QVBoxLayout(props_container)
-        props_layout.setContentsMargins(8, 8, 8, 8)
-        props_layout.setSpacing(8)
+        props_layout.setContentsMargins(0, 0, 0, 0)
+        props_layout.setSpacing(0)
 
-        # 文件信息组
-        file_group = QGroupBox("文件信息")
-        file_layout = QVBoxLayout(file_group)
-        self.file_info_table = QTableWidget()
-        self.file_info_table.setColumnCount(2)
-        self.file_info_table.setHorizontalHeaderLabels(["属性", "值"])
-        self.file_info_table.horizontalHeader().setStretchLastSection(True)
-        self.file_info_table.verticalHeader().setVisible(False)
-        self.file_info_table.setAlternatingRowColors(True)
-        self.file_info_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.file_info_table.setMaximumHeight(160)
-        file_layout.addWidget(self.file_info_table)
-        props_layout.addWidget(file_group)
+        # These widgets keep the selection state for existing update logic, but are not
+        # shown because the right dock is dedicated to the document preview.
+        self.selection_title_label = QLabel("未选择对象或损伤节点")
+        self.selection_title_label.setObjectName("accentLabel")
+        self.selection_title_label.setWordWrap(True)
+        self.selection_meta_label = QLabel("请选择模型中的 object，或点击左侧损伤树节点。")
+        self.selection_meta_label.setWordWrap(True)
 
-        # 几何信息组
-        geo_group = QGroupBox("几何信息")
-        geo_layout = QVBoxLayout(geo_group)
-        self.geo_info_table = QTableWidget()
-        self.geo_info_table.setColumnCount(2)
-        self.geo_info_table.setHorizontalHeaderLabels(["属性", "值"])
-        self.geo_info_table.horizontalHeader().setStretchLastSection(True)
-        self.geo_info_table.verticalHeader().setVisible(False)
-        self.geo_info_table.setAlternatingRowColors(True)
-        self.geo_info_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        geo_layout.addWidget(self.geo_info_table)
-        props_layout.addWidget(geo_group)
+        self.catalog_table = QTableWidget()
+        self.catalog_table.setColumnCount(3)
+        self.catalog_table.setHorizontalHeaderLabels(["名称", "匹配ID", "文档"])
+        self.catalog_table.horizontalHeader().setStretchLastSection(True)
+        self.catalog_table.verticalHeader().setVisible(False)
+        self.catalog_table.setAlternatingRowColors(True)
+        self.catalog_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.catalog_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.catalog_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.catalog_table.setMaximumHeight(140)
+        self.catalog_table.cellClicked.connect(self._on_catalog_row_clicked)
 
-        # 显示选项组
-        display_group = QGroupBox("显示选项")
-        display_layout = QVBoxLayout(display_group)
+        self.document_status_label = QLabel("未选择文档")
+        self.document_status_label.setWordWrap(True)
+        self.open_document_button = QPushButton("打开文档")
+        self.open_document_button.setEnabled(False)
+        self.open_document_button.clicked.connect(self._open_current_document)
 
-        self.chk_wireframe = QCheckBox("线框模式")
-        self.chk_wireframe.toggled.connect(self._toggle_wireframe)
-        display_layout.addWidget(self.chk_wireframe)
+        self.document_view = QStackedWidget()
+        self.document_message_view = QLabel("未选择文档")
+        self.document_message_view.setAlignment(Qt.AlignCenter)
+        self.document_message_view.setWordWrap(True)
+        self.document_view.addWidget(self.document_message_view)
 
-        self.chk_grid = QCheckBox("显示网格")
-        self.chk_grid.setChecked(True)
-        self.chk_grid.toggled.connect(self.vtk_widget.toggle_grid)
-        display_layout.addWidget(self.chk_grid)
+        if QPdfDocument is not None and QPdfView is not None:
+            self.pdf_document = QPdfDocument(self)
+            self.pdf_view = QPdfView()
+            self.pdf_view.setDocument(self.pdf_document)
+            self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+            self.document_view.addWidget(self.pdf_view)
+        else:
+            self.pdf_document = None
+            self.pdf_view = None
 
-        props_layout.addWidget(display_group)
+        if QWebEngineView is not None:
+            self.web_document_view = QWebEngineView()
+            self._configure_document_view(self.web_document_view)
+            self.document_view.addWidget(self.web_document_view)
+        else:
+            self.web_document_view = None
 
-        props_layout.addStretch()
+        self.document_view.setMinimumHeight(260)
+        props_layout.addWidget(self.document_view, 1)
+
         self.props_dock.setWidget(props_container)
         self.addDockWidget(Qt.RightDockWidgetArea, self.props_dock)
 
@@ -360,9 +400,125 @@ class MainWindow(QMainWindow):
     def _init_vtk(self):
         """延迟初始化VTK"""
         self.vtk_widget.initialize()
+        if os.path.exists(self._viewport_background_path):
+            self.vtk_widget.set_background_image(self._viewport_background_path)
 
     def _reload_damage_tree(self):
+        self._load_pdf_catalog_from_csv()
         self._load_damage_tree_from_csv()
+
+    def _configure_document_view(self, document_view):
+        if QWebEngineSettings is None:
+            return
+
+        settings = document_view.settings()
+        web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
+        for setting_name in (
+            "PdfViewerEnabled",
+            "LocalContentCanAccessFileUrls",
+            "LocalContentCanAccessRemoteUrls",
+        ):
+            attr = getattr(web_attribute, setting_name, None)
+            if attr is None:
+                attr = getattr(QWebEngineSettings, setting_name, None)
+            if attr is not None:
+                settings.setAttribute(attr, True)
+
+    def _load_pdf_catalog_from_csv(self, csv_path=None):
+        csv_path = csv_path or self._pdf_catalog_csv_path
+        self._pdf_catalog_rows = []
+        self._pdf_catalog_by_model_name.clear()
+        self._pdf_catalog_by_damage_leaf_id.clear()
+
+        if not os.path.exists(csv_path):
+            self._set_document_message(f"未找到文档目录文件: {os.path.basename(csv_path)}")
+            return
+
+        try:
+            rows = self._read_pdf_catalog_rows(csv_path)
+        except Exception as exc:
+            self._set_document_message(f"读取文档目录失败: {exc}")
+            return
+
+        self._pdf_catalog_rows = rows
+        for row in rows:
+            model_name = row["model_name"]
+            damage_leaf_id = row["damage_leaf_id"]
+            if model_name:
+                self._pdf_catalog_by_model_name[model_name].append(row)
+            if damage_leaf_id:
+                self._pdf_catalog_by_damage_leaf_id[damage_leaf_id].append(row)
+            elif model_name:
+                self._pdf_catalog_by_damage_leaf_id[model_name].append(row)
+
+        if not rows:
+            self._set_document_message("文档目录为空。")
+
+    def _read_pdf_catalog_rows(self, csv_path):
+        last_error = None
+        for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+            try:
+                with open(csv_path, "r", encoding=encoding, newline="") as f:
+                    reader = csv.reader(f)
+                    next(reader, None)  # header
+                    rows = []
+                    for idx, row in enumerate(reader, start=2):
+                        if not row or not any(col.strip() for col in row):
+                            continue
+
+                        cols = list(row) + [""] * (4 - len(row))
+                        model_name = cols[0].strip()
+                        display_name = cols[1].strip()
+                        document_path = cols[2].strip()
+                        damage_leaf_id = cols[3].strip()
+                        if not any((model_name, display_name, document_path, damage_leaf_id)):
+                            continue
+                        rows.append(
+                            {
+                                "model_name": model_name,
+                                "display_name": display_name or model_name or damage_leaf_id,
+                                "document_path": document_path,
+                                "damage_leaf_id": damage_leaf_id,
+                                "row_number": idx,
+                            }
+                        )
+                    return rows
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                continue
+
+        if last_error:
+            raise last_error
+        return []
+
+    def _resolve_document_path(self, document_path):
+        raw_path = (document_path or "").strip().strip('"')
+        if not raw_path:
+            return ""
+
+        if re.match(r"^[A-Za-z]:[\\/]", raw_path):
+            return os.path.normpath(raw_path)
+
+        if raw_path.startswith(("/", "\\")):
+            raw_path = raw_path.lstrip("/\\")
+
+        if os.path.isabs(raw_path):
+            return os.path.normpath(raw_path)
+
+        if not os.path.dirname(raw_path):
+            pdfs_path = os.path.normpath(os.path.join(self._project_root, "pdfs", raw_path))
+            if os.path.exists(pdfs_path):
+                return pdfs_path
+
+        project_path = os.path.normpath(os.path.join(self._project_root, raw_path))
+        if os.path.exists(project_path):
+            return project_path
+
+        pdfs_path = os.path.normpath(os.path.join(self._project_root, "pdfs", os.path.basename(raw_path)))
+        if os.path.exists(pdfs_path):
+            return pdfs_path
+
+        return project_path
 
     def _load_damage_tree_from_csv(self, csv_path=None):
         csv_path = csv_path or self._damage_tree_csv_path
@@ -560,6 +716,8 @@ class MainWindow(QMainWindow):
 
             self.vtk_widget.clear_scene()
             self._loaded_items = []
+            self._actor_catalog_names.clear()
+            self._actor_display_names.clear()
 
             importer = vtk.vtkGLTFImporter()
             importer.SetRenderWindow(self.vtk_widget.render_window)
@@ -570,6 +728,7 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(60)
             self.status_label.setText("正在优化贴图质量...")
 
+            gltf_name_entries = self._read_gltf_renderable_name_entries(filepath)
             imported = importer.GetImportedActors()
             imported.InitTraversal()
             imported_count = imported.GetNumberOfItems()
@@ -579,6 +738,7 @@ class MainWindow(QMainWindow):
             object_count = 0
             textured_count = 0
             actor_index = 0
+            imported_actors = []
 
             while True:
                 actor = imported.GetNextActor()
@@ -589,17 +749,36 @@ class MainWindow(QMainWindow):
                     textured_count += 1
                 self._optimize_actor_texture(actor, max_texture_size=texture_max_size)
                 self._optimize_actor_material_for_speed(actor)
-
-                actor_name = f"actor_{actor_index}"
-                self.vtk_widget.add_actor(actor, actor_name, add_to_renderer=False)
-
                 points, cells = self._get_actor_geometry_stats(actor)
+                imported_actors.append((actor, points, cells, self._vtk_object_name(actor)))
+
+            display_names = self._match_gltf_display_names(
+                gltf_name_entries,
+                [(points, cells) for _actor, points, cells, _actor_object_name in imported_actors],
+            )
+
+            for actor, points, cells, actor_object_name in imported_actors:
+                actor_name = f"actor_{actor_index}"
+                matched_name = display_names[actor_index] if actor_index < len(display_names) else ""
+                original_name = self._original_display_name(
+                    actor_object_name or matched_name,
+                    f"Object_{actor_index}",
+                )
+                catalog_name = self._best_catalog_name(
+                    original_name,
+                    matched_name,
+                    f"Object_{actor_index}",
+                )
+                self.vtk_widget.add_actor(actor, actor_name, add_to_renderer=False)
+                self._actor_catalog_names[actor_name] = catalog_name
+                self._actor_display_names[actor_name] = original_name
+
                 total_verts += points
                 total_faces += cells
                 object_count += 1
                 self._loaded_items.append({
                     "actor": actor,
-                    "name": f"Object_{actor_index}",
+                    "name": original_name,
                     "type": "Mesh",
                     "points": points,
                     "cells": cells,
@@ -629,6 +808,209 @@ class MainWindow(QMainWindow):
             self.status_label.setText("加载失败")
             QMessageBox.critical(self, "加载错误", f"贴图加载失败: {str(e)}")
 
+    def _read_gltf_renderable_name_entries(self, filepath):
+        try:
+            gltf = self._read_gltf_json(filepath)
+        except Exception:
+            return {"primitive": [], "node": []}
+
+        nodes = gltf.get("nodes") or []
+        meshes = gltf.get("meshes") or []
+        accessors = gltf.get("accessors") or []
+        if not nodes:
+            return {"primitive": [], "node": []}
+
+        primitive_entries = []
+        node_entries = []
+        visited = set()
+
+        def node_display_name(node, node_idx):
+            node_name = str(node.get("name") or "").strip()
+            mesh_idx = node.get("mesh")
+            mesh_name = ""
+            if isinstance(mesh_idx, int) and 0 <= mesh_idx < len(meshes):
+                mesh_name = str(meshes[mesh_idx].get("name") or "").strip()
+            return node_name or mesh_name or f"Node_{node_idx}"
+
+        def node_primitives(node):
+            mesh_idx = node.get("mesh")
+            if not isinstance(mesh_idx, int) or mesh_idx < 0 or mesh_idx >= len(meshes):
+                return []
+            return meshes[mesh_idx].get("primitives") or []
+
+        def accessor_count(accessor_idx):
+            if not isinstance(accessor_idx, int) or accessor_idx < 0 or accessor_idx >= len(accessors):
+                return 0
+            return int(accessors[accessor_idx].get("count") or 0)
+
+        def primitive_geometry(primitive):
+            attributes = primitive.get("attributes") or {}
+            points = accessor_count(attributes.get("POSITION"))
+            index_count = accessor_count(primitive.get("indices"))
+            draw_count = index_count or points
+            mode = int(primitive.get("mode", 4))
+            if mode == 4:  # TRIANGLES
+                cells = draw_count // 3
+            elif mode in (5, 6):  # TRIANGLE_STRIP / TRIANGLE_FAN
+                cells = max(0, draw_count - 2)
+            elif mode == 1:  # LINES
+                cells = draw_count // 2
+            elif mode == 3:  # LINE_STRIP
+                cells = max(0, draw_count - 1)
+            else:
+                cells = draw_count
+            return points, cells
+
+        def visit(node_idx):
+            if not isinstance(node_idx, int) or node_idx < 0 or node_idx >= len(nodes):
+                return
+            if node_idx in visited:
+                return
+            visited.add(node_idx)
+
+            node = nodes[node_idx]
+            primitives = node_primitives(node)
+            if primitives:
+                display_name = node_display_name(node, node_idx)
+                node_points = 0
+                node_cells = 0
+                for primitive in primitives:
+                    points, cells = primitive_geometry(primitive)
+                    node_points += points
+                    node_cells += cells
+                    primitive_entries.append({
+                        "name": display_name,
+                        "points": points,
+                        "cells": cells,
+                    })
+                node_entries.append({
+                    "name": display_name,
+                    "points": node_points,
+                    "cells": node_cells,
+                })
+
+            for child_idx in node.get("children") or []:
+                visit(child_idx)
+
+        scene_indices = []
+        scenes = gltf.get("scenes") or []
+        scene_idx = gltf.get("scene")
+        if isinstance(scene_idx, int) and 0 <= scene_idx < len(scenes):
+            scene_indices = scenes[scene_idx].get("nodes") or []
+        elif scenes:
+            for scene in scenes:
+                scene_indices.extend(scene.get("nodes") or [])
+
+        if scene_indices:
+            for node_idx in scene_indices:
+                visit(node_idx)
+
+        for node_idx, node in enumerate(nodes):
+            if node_idx not in visited and node_primitives(node):
+                visit(node_idx)
+
+        return {"primitive": primitive_entries, "node": node_entries}
+
+    def _match_gltf_display_names(self, name_entries, actor_stats):
+        primitive_entries = list(name_entries.get("primitive") or [])
+        node_entries = list(name_entries.get("node") or [])
+        if not actor_stats:
+            return []
+
+        if len(node_entries) == len(actor_stats):
+            ordered_entries = node_entries
+        elif len(primitive_entries) == len(actor_stats):
+            ordered_entries = primitive_entries
+        else:
+            ordered_entries = node_entries or primitive_entries
+
+        match_entries = self._dedupe_gltf_match_entries([*node_entries, *primitive_entries])
+        display_names = [None] * len(actor_stats)
+        used_entry_indexes = set()
+
+        for actor_idx, (points, cells) in enumerate(actor_stats):
+            exact_indexes = [
+                entry_idx
+                for entry_idx, entry in enumerate(match_entries)
+                if entry_idx not in used_entry_indexes
+                and entry.get("points") == points
+                and entry.get("cells") == cells
+            ]
+            if len(exact_indexes) == 1:
+                entry_idx = exact_indexes[0]
+                used_entry_indexes.add(entry_idx)
+                display_names[actor_idx] = match_entries[entry_idx]["name"]
+
+        for actor_idx, (points, cells) in enumerate(actor_stats):
+            if display_names[actor_idx]:
+                continue
+            exact_indexes = [
+                entry_idx
+                for entry_idx, entry in enumerate(match_entries)
+                if entry_idx not in used_entry_indexes
+                and entry.get("points") == points
+                and entry.get("cells") == cells
+            ]
+            if exact_indexes:
+                entry_idx = exact_indexes[0]
+                used_entry_indexes.add(entry_idx)
+                display_names[actor_idx] = match_entries[entry_idx]["name"]
+
+        for actor_idx, name in enumerate(display_names):
+            if name:
+                continue
+            if actor_idx < len(ordered_entries):
+                display_names[actor_idx] = ordered_entries[actor_idx]["name"]
+
+        return [name or "" for name in display_names]
+
+    def _dedupe_gltf_match_entries(self, entries):
+        unique_entries = []
+        seen = set()
+        for entry in entries:
+            key = (entry.get("name"), entry.get("points"), entry.get("cells"))
+            if key in seen:
+                continue
+            unique_entries.append(entry)
+            seen.add(key)
+        return unique_entries
+
+    def _vtk_object_name(self, actor):
+        getter = getattr(actor, "GetObjectName", None)
+        if not callable(getter):
+            return ""
+        try:
+            return str(getter() or "").strip()
+        except Exception:
+            return ""
+
+    def _read_gltf_json(self, filepath):
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext == ".gltf":
+            with open(filepath, "r", encoding="utf-8-sig") as f:
+                return json.load(f)
+
+        with open(filepath, "rb") as f:
+            header = f.read(12)
+            if len(header) != 12:
+                raise ValueError("GLB header is incomplete")
+            magic, _version, length = struct.unpack("<4sII", header)
+            if magic != b"glTF":
+                raise ValueError("Invalid GLB file")
+
+            bytes_read = 12
+            while bytes_read + 8 <= length:
+                chunk_header = f.read(8)
+                if len(chunk_header) != 8:
+                    break
+                chunk_length, chunk_type = struct.unpack("<II", chunk_header)
+                chunk_data = f.read(chunk_length)
+                bytes_read += 8 + chunk_length
+                if chunk_type == 0x4E4F534A:
+                    return json.loads(chunk_data.decode("utf-8").rstrip("\x00 \t\r\n"))
+
+        raise ValueError("GLB JSON chunk not found")
+
     def _on_load_progress(self, percent, description):
         """加载进度回调"""
         self.progress_bar.setValue(percent)
@@ -641,6 +1023,8 @@ class MainWindow(QMainWindow):
         # 清空旧场景
         self.vtk_widget.clear_scene()
         self._loaded_items = actors
+        self._actor_catalog_names.clear()
+        self._actor_display_names.clear()
 
         total_verts = 0
         total_faces = 0
@@ -650,12 +1034,29 @@ class MainWindow(QMainWindow):
             actor = item_data["actor"]
             actor_name = f"actor_{i}"
             self.vtk_widget.add_actor(actor, actor_name)
+            self._actor_catalog_names[actor_name] = self._best_catalog_name(
+                item_data.get("name"),
+                f"Object_{i}",
+            )
+            self._actor_display_names[actor_name] = self._original_display_name(
+                item_data.get("name"),
+                actor_name,
+            )
 
             sub_items = item_data.get("sub_items") or []
             if sub_items:
                 object_count += len(sub_items)
-                for sub in sub_items:
+                for sub_idx, sub in enumerate(sub_items):
                     sub_name = f"{actor_name}_block_{sub['flat_index']}"
+                    self._actor_catalog_names[sub_name] = self._best_catalog_name(
+                        sub.get("name"),
+                        f"Object_{sub_idx}",
+                        f"Object_{sub['flat_index']}",
+                    )
+                    self._actor_display_names[sub_name] = self._original_display_name(
+                        sub.get("name"),
+                        sub_name,
+                    )
                     self.vtk_widget.register_actor_alias(
                         alias_name=sub_name,
                         base_name=actor_name,
@@ -700,6 +1101,11 @@ class MainWindow(QMainWindow):
             # 点击空白处，清除高亮和选中
             self.vtk_widget.highlight_actor("")
             self._update_geo_info_all(0, 0, self._get_loaded_object_count())
+            self.selection_title_label.setText("未选择对象或损伤节点")
+            self.selection_meta_label.setText("请选择模型中的 object，或点击左侧损伤树节点。")
+            self.catalog_table.setRowCount(0)
+            self._current_catalog_matches = []
+            self._set_document_message("未选择文档")
             return
 
         # 高亮
@@ -707,6 +1113,22 @@ class MainWindow(QMainWindow):
         info = self.vtk_widget.get_actor_info(actor_name)
         if info:
             self._update_geo_info(info)
+
+        catalog_key = self._catalog_key_for_actor(actor_name)
+        display_name = self._display_name_for_actor(actor_name)
+        meta_parts = [f"选择名称: {display_name}"]
+        if info:
+            meta_parts.extend(f"{key}: {value}" for key, value in info.items())
+        matches = self._pdf_catalog_by_model_name.get(catalog_key, [])
+        if catalog_key != display_name:
+            meta_parts.append(f"匹配模型名称: {catalog_key}")
+        self._show_catalog_matches(
+            source_type="model",
+            source_key=catalog_key,
+            display_name=f"模型对象: {display_name}",
+            matches=matches,
+            meta="  |  ".join(meta_parts),
+        )
 
     def _on_tree_item_clicked(self, item, column):
         """树节点点击事件"""
@@ -716,8 +1138,20 @@ class MainWindow(QMainWindow):
                 item.setExpanded(not item.isExpanded())
 
             parent_id = item.data(0, self.DAMAGE_PARENT_ID_ROLE) or "无"
+            matches = self._pdf_catalog_by_damage_leaf_id.get(node_id, [])
+            highlighted_names = self._selection_names_for_catalog_rows(matches)
+            self.vtk_widget.highlight_actors(highlighted_names)
+
+            highlight_text = f"  |  高亮对象: {len(highlighted_names)}" if highlighted_names else ""
             self.status_label.setText(
-                f"损伤节点: {item.text(0)}  |  节点ID: {node_id}  |  上级ID: {parent_id}  |  下级: {item.childCount()}"
+                f"损伤节点: {item.text(0)}  |  节点ID: {node_id}  |  上级ID: {parent_id}  |  下级: {item.childCount()}{highlight_text}"
+            )
+            self._show_catalog_matches(
+                source_type="damage",
+                source_key=node_id,
+                display_name=f"损伤节点: {item.text(0)}",
+                matches=matches,
+                meta=f"节点ID: {node_id}  |  上级ID: {parent_id}  |  下级: {item.childCount()}",
             )
             return
 
@@ -727,15 +1161,204 @@ class MainWindow(QMainWindow):
             info = self.vtk_widget.get_actor_info(actor_name)
             if info:
                 self._update_geo_info(info)
+            catalog_key = self._catalog_key_for_actor(actor_name)
+            display_name = self._display_name_for_actor(actor_name)
+            meta_parts = [f"选择名称: {display_name}"]
+            if info:
+                meta_parts.extend(f"{key}: {value}" for key, value in info.items())
+            if catalog_key != display_name:
+                meta_parts.append(f"匹配模型名称: {catalog_key}")
+            self._show_catalog_matches(
+                source_type="model",
+                source_key=catalog_key,
+                display_name=f"模型对象: {display_name}",
+                matches=self._pdf_catalog_by_model_name.get(catalog_key, []),
+                meta="  |  ".join(meta_parts),
+            )
+
+    def _selection_names_for_catalog_rows(self, rows):
+        selection_names = []
+        seen = set()
+        for row in rows:
+            for selection_name in self._selection_names_for_catalog_key(row.get("model_name", "")):
+                if selection_name in seen:
+                    continue
+                selection_names.append(selection_name)
+                seen.add(selection_name)
+        return selection_names
+
+    def _selection_names_for_catalog_key(self, catalog_key):
+        if not catalog_key:
+            return []
+
+        matches = []
+        for selection_name in self._actor_catalog_names:
+            if self._catalog_key_for_actor(selection_name) == catalog_key:
+                matches.append(selection_name)
+        return matches
+
+    def _original_display_name(self, name, fallback):
+        name = str(name or "").strip()
+        return name or fallback
+
+    def _display_name_for_actor(self, actor_name):
+        return self._actor_display_names.get(actor_name) or actor_name
+
+    def _best_catalog_name(self, *candidates):
+        fallback = ""
+        for candidate in candidates:
+            if not candidate:
+                continue
+            candidate = str(candidate).strip()
+            if not fallback:
+                fallback = candidate
+            if candidate in self._pdf_catalog_by_model_name:
+                return candidate
+        return fallback
+
+    def _catalog_key_for_actor(self, actor_name):
+        if not actor_name:
+            return ""
+
+        mapped_name = self._actor_catalog_names.get(actor_name)
+        if mapped_name and mapped_name in self._pdf_catalog_by_model_name:
+            return mapped_name
+
+        if actor_name.startswith("Object_"):
+            return actor_name
+
+        block_match = re.search(r"_block_(\d+)$", actor_name)
+        if block_match:
+            fallback_name = f"Object_{block_match.group(1)}"
+            if fallback_name in self._pdf_catalog_by_model_name:
+                return fallback_name
+
+        actor_match = re.fullmatch(r"actor_(\d+)", actor_name)
+        if actor_match:
+            fallback_name = f"Object_{actor_match.group(1)}"
+            if fallback_name in self._pdf_catalog_by_model_name:
+                return fallback_name
+
+        return mapped_name or actor_name
+
+    def _show_catalog_matches(self, source_type, source_key, display_name, matches, meta=""):
+        self.selection_title_label.setText(display_name)
+        lookup_label = "模型名称" if source_type == "model" else "毁伤叶子ID"
+        self.selection_meta_label.setText(meta or f"{lookup_label}: {source_key}")
+
+        self._current_catalog_matches = list(matches)
+        self.catalog_table.blockSignals(True)
+        self.catalog_table.setRowCount(len(self._current_catalog_matches))
+        for row_idx, row in enumerate(self._current_catalog_matches):
+            match_id = row["model_name"] if source_type == "model" else row["damage_leaf_id"]
+            values = (
+                row["display_name"],
+                match_id or source_key,
+                os.path.basename(row["document_path"]) or row["document_path"],
+            )
+            for col_idx, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.UserRole, row_idx)
+                self.catalog_table.setItem(row_idx, col_idx, item)
+        self.catalog_table.blockSignals(False)
+
+        if self._current_catalog_matches:
+            self.catalog_table.selectRow(0)
+            self._display_catalog_row(0)
+            return
+
+        self._set_document_message(f"未在文档目录中找到匹配项: {lookup_label} = {source_key}")
+
+    def _on_catalog_row_clicked(self, row, column):
+        self._display_catalog_row(row)
+
+    def _display_catalog_row(self, row_idx):
+        if row_idx < 0 or row_idx >= len(self._current_catalog_matches):
+            self._set_document_message("未选择文档")
+            return
+
+        row = self._current_catalog_matches[row_idx]
+        document_path = row["document_path"]
+        resolved_path = self._resolve_document_path(document_path)
+        title = row["display_name"] or row["model_name"] or row["damage_leaf_id"]
+
+        if not document_path:
+            self._set_document_message(f"{title} 没有配置文档路径。")
+            return
+
+        if not os.path.exists(resolved_path):
+            self._set_document_message(
+                f"文档文件不存在: {document_path}\n解析路径: {resolved_path}"
+            )
+            return
+
+        self._current_document_path = resolved_path
+        self.open_document_button.setEnabled(True)
+        self._load_document_preview(resolved_path, title)
+
+    def _load_document_preview(self, resolved_path, title):
+        filename = os.path.basename(resolved_path)
+        ext = os.path.splitext(resolved_path)[1].lower()
+
+        if ext == ".pdf":
+            if self.pdf_document is None or self.pdf_view is None:
+                self._show_document_message(f"已匹配 PDF，但当前 PySide6 环境未启用 QtPdf。\n{resolved_path}")
+                self.document_status_label.setText(f"无法预览: {title} ({filename})")
+                return
+
+            self.pdf_document.close()
+            error = self.pdf_document.load(resolved_path)
+            if error != QPdfDocument.Error.None_:
+                self._show_document_message(f"PDF 加载失败: {error.name}\n{resolved_path}")
+                self.document_status_label.setText(f"PDF 加载失败: {title} ({filename})")
+                return
+
+            self.document_view.setCurrentWidget(self.pdf_view)
+            self.document_status_label.setText(f"正在显示: {title} ({filename})")
+            return
+
+        if self.web_document_view is None:
+            self._show_document_message(f"已匹配文档，但当前 PySide6 环境未启用 QtWebEngine。\n{resolved_path}")
+            self.document_status_label.setText(f"无法预览: {title} ({filename})")
+            return
+
+        self.web_document_view.load(QUrl.fromLocalFile(resolved_path))
+        self.document_view.setCurrentWidget(self.web_document_view)
+        self.document_status_label.setText(f"正在显示: {title} ({filename})")
+
+    def _set_document_message(self, message):
+        self._current_document_path = None
+        if hasattr(self, "open_document_button"):
+            self.open_document_button.setEnabled(False)
+        if hasattr(self, "document_status_label"):
+            self.document_status_label.setText(message)
+        if not hasattr(self, "document_message_view"):
+            return
+
+        self._show_document_message(message)
+
+    def _show_document_message(self, message):
+        self.document_message_view.setText(message)
+        self.document_view.setCurrentWidget(self.document_message_view)
+
+    def _open_current_document(self):
+        if not self._current_document_path:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self._current_document_path))
 
     def clear_scene(self):
         """清空场景"""
         self.vtk_widget.clear_scene()
         self._gltf_importer = None
         self._loaded_items = []
+        self._actor_catalog_names.clear()
+        self._actor_display_names.clear()
         self._current_file = None
-        self.file_info_table.setRowCount(0)
-        self.geo_info_table.setRowCount(0)
+        self.catalog_table.setRowCount(0)
+        self._current_catalog_matches = []
+        self.selection_title_label.setText("未选择对象或损伤节点")
+        self.selection_meta_label.setText("请选择模型中的 object，或点击左侧损伤树节点。")
+        self._set_document_message("未选择文档")
         self.vertex_label.setText("")
         self.status_label.setText("场景已清空")
         self.vtk_widget.refresh()
@@ -757,13 +1380,16 @@ class MainWindow(QMainWindow):
         # 同步所有关联控件
         self.action_wireframe.blockSignals(True)
         self.btn_wireframe.blockSignals(True)
-        self.chk_wireframe.blockSignals(True)
+        if hasattr(self, "chk_wireframe"):
+            self.chk_wireframe.blockSignals(True)
         self.action_wireframe.setChecked(checked)
         self.btn_wireframe.setChecked(checked)
-        self.chk_wireframe.setChecked(checked)
+        if hasattr(self, "chk_wireframe"):
+            self.chk_wireframe.setChecked(checked)
         self.action_wireframe.blockSignals(False)
         self.btn_wireframe.blockSignals(False)
-        self.chk_wireframe.blockSignals(False)
+        if hasattr(self, "chk_wireframe"):
+            self.chk_wireframe.blockSignals(False)
 
     def _actor_has_any_texture(self, actor):
         if actor is None:
@@ -885,31 +1511,16 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def _update_file_info(self, filepath):
-        """更新文件信息表"""
-        info = get_file_info(filepath)
-        self.file_info_table.setRowCount(len(info))
-        for row, (key, value) in enumerate(info.items()):
-            self.file_info_table.setItem(row, 0, QTableWidgetItem(key))
-            self.file_info_table.setItem(row, 1, QTableWidgetItem(str(value)))
+        """右侧栏不再显示文件属性；保留方法避免加载流程分叉。"""
+        return
 
     def _update_geo_info(self, info):
-        """更新几何信息表（单个对象）"""
-        self.geo_info_table.setRowCount(len(info))
-        for row, (key, value) in enumerate(info.items()):
-            self.geo_info_table.setItem(row, 0, QTableWidgetItem(key))
-            self.geo_info_table.setItem(row, 1, QTableWidgetItem(str(value)))
+        """几何信息合并到当前选择摘要，不再单独显示表格。"""
+        return
 
     def _update_geo_info_all(self, total_verts, total_faces, obj_count):
-        """更新几何信息表（汇总）"""
-        info = {
-            "对象数量": str(obj_count),
-            "总顶点数": f"{total_verts:,}",
-            "总面片数": f"{total_faces:,}",
-        }
-        self.geo_info_table.setRowCount(len(info))
-        for row, (key, value) in enumerate(info.items()):
-            self.geo_info_table.setItem(row, 0, QTableWidgetItem(key))
-            self.geo_info_table.setItem(row, 1, QTableWidgetItem(value))
+        """右侧栏只显示当前选择和文档，不显示场景汇总。"""
+        return
 
     def _show_about(self):
         """显示关于对话框"""

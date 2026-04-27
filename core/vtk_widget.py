@@ -16,6 +16,8 @@ class VTKWidget(QWidget):
     DYNAMIC_HIDE_MIN_ACTOR_COUNT = 800
     DYNAMIC_HIDE_MAX_ANGULAR_SIZE_RAD = 0.01
     DYNAMIC_HIDE_MAX_CELLS = 40_000
+    CAMERA_VIEW_ANGLE_DEG = 28.0
+    CAMERA_FRAME_PADDING = 1.08
 
     # 信号
     model_clicked = Signal(str)
@@ -32,6 +34,11 @@ class VTKWidget(QWidget):
         self._base_to_dataset_alias = {}  # base_name -> {dataset_ptr: sel_name}
         self._actor_sphere = {}  # base_name -> (cx, cy, cz, radius)
         self._selected_actor_name = None
+        self._selected_actor_names = []
+        self._highlight_overlay_actors = {}
+        self._background_image_reader = None
+        self._background_texture = None
+        self._skybox_actor = None
         self._dynamic_hidden_actor_names = set()
         self._dynamic_hide_active = False
         self._setup_ui()
@@ -74,6 +81,65 @@ class VTKWidget(QWidget):
         self._add_axes_widget()
         self._add_grid_floor()
         self._setup_lighting()
+
+    def set_background_image(self, filepath):
+        if filepath.lower().endswith((".hdr", ".pic")):
+            return self.set_environment_texture(filepath)
+
+        reader_factory = vtk.vtkImageReader2Factory()
+        reader = reader_factory.CreateImageReader2(filepath)
+        if reader is None:
+            return False
+
+        reader.SetFileName(filepath)
+        reader.Update()
+
+        texture = vtk.vtkTexture()
+        texture.SetInputConnection(reader.GetOutputPort())
+        texture.InterpolateOn()
+        texture.RepeatOff()
+
+        self._background_image_reader = reader
+        self._background_texture = texture
+        self.renderer.SetBackgroundTexture(texture)
+        self.renderer.TexturedBackgroundOn()
+        self.renderer.GradientBackgroundOff()
+        self.render_window.Render()
+        return True
+
+    def set_environment_texture(self, filepath):
+        reader = vtk.vtkHDRReader()
+        if not reader.CanReadFile(filepath):
+            return False
+
+        reader.SetFileName(filepath)
+        reader.Update()
+
+        texture = vtk.vtkTexture()
+        texture.SetInputConnection(reader.GetOutputPort())
+        texture.SetColorModeToDirectScalars()
+        texture.MipmapOn()
+        texture.InterpolateOn()
+
+        if self._skybox_actor is not None:
+            self.renderer.RemoveActor(self._skybox_actor)
+
+        skybox = vtk.vtkSkybox()
+        skybox.SetTexture(texture)
+        skybox.SetProjectionToSphere()
+        skybox.SetFloorRight(0, 0, 1)
+
+        self._background_image_reader = reader
+        self._background_texture = texture
+        self._skybox_actor = skybox
+        self.renderer.AddActor(skybox)
+        self.renderer.SetEnvironmentTexture(texture, False)
+        self.renderer.UseImageBasedLightingOn()
+        self.renderer.UseSphericalHarmonicsOn()
+        self.renderer.TexturedBackgroundOff()
+        self.renderer.GradientBackgroundOff()
+        self.render_window.Render()
+        return True
 
     def _setup_lighting(self):
         self.renderer.RemoveAllLights()
@@ -137,9 +203,28 @@ class VTKWidget(QWidget):
         if actor:
             for name, a in self._actors.items():
                 if a == actor:
-                    clicked_name = name
+                    clicked_name = self._selection_name_for_pick(name)
                     break
         self.model_clicked.emit(clicked_name)
+
+    def _selection_name_for_pick(self, base_name):
+        dataset = self.picker.GetDataSet() if hasattr(self.picker, "GetDataSet") else None
+        dataset_ptr = getattr(dataset, "__this__", "") if dataset is not None else ""
+        if dataset_ptr:
+            alias_name = self._base_to_dataset_alias.get(base_name, {}).get(dataset_ptr)
+            if alias_name:
+                return alias_name
+
+        if hasattr(self.picker, "GetFlatBlockIndex"):
+            try:
+                flat_index = int(self.picker.GetFlatBlockIndex())
+            except (TypeError, ValueError):
+                flat_index = -1
+            alias_name = self._base_to_flat_alias.get(base_name, {}).get(flat_index)
+            if alias_name:
+                return alias_name
+
+        return base_name
 
     def _on_start_interaction(self, obj, event):
         if self._dynamic_hide_active:
@@ -150,13 +235,16 @@ class VTKWidget(QWidget):
         if camera is None:
             return
 
-        selected_base = ""
-        if self._selected_actor_name in self._selection_targets:
-            selected_base, _ = self._selection_targets[self._selected_actor_name]
+        selected_bases = {
+            target[0]
+            for selected_name in self._selected_actor_names
+            for target in [self._selection_targets.get(selected_name)]
+            if target
+        }
 
         self._dynamic_hidden_actor_names.clear()
         for name, actor in self._actors.items():
-            if name == selected_base or not actor.GetVisibility():
+            if name in selected_bases or not actor.GetVisibility():
                 continue
             if self._should_temporarily_hide_actor(name, camera):
                 actor.SetVisibility(False)
@@ -294,11 +382,20 @@ class VTKWidget(QWidget):
 
     def remove_actor(self, name):
         if name in self._actors:
-            if self._selected_actor_name:
-                selected_base, _ = self._selection_targets.get(self._selected_actor_name, ("", None))
-                if selected_base == name:
-                    self._clear_highlight(self._selected_actor_name)
-                    self._selected_actor_name = None
+            selected_names = [
+                selected_name
+                for selected_name in self._selected_actor_names
+                if self._selection_targets.get(selected_name, ("", None))[0] == name
+            ]
+            for selected_name in selected_names:
+                self._clear_highlight(selected_name)
+            if selected_names:
+                self._selected_actor_names = [
+                    selected_name
+                    for selected_name in self._selected_actor_names
+                    if selected_name not in selected_names
+                ]
+                self._selected_actor_name = self._selected_actor_names[0] if self._selected_actor_names else None
             self.renderer.RemoveActor(self._actors[name])
             del self._actors[name]
             self._actor_geometry.pop(name, None)
@@ -308,8 +405,9 @@ class VTKWidget(QWidget):
             self._remove_selection_entries_for_base(name)
 
     def clear_scene(self):
-        if self._selected_actor_name:
-            self._clear_highlight(self._selected_actor_name)
+        for selected_name in self._selected_actor_names:
+            self._clear_highlight(selected_name)
+        self._remove_all_highlight_overlays()
         for actor in self._actors.values():
             self.renderer.RemoveActor(actor)
         self._actors.clear()
@@ -324,45 +422,115 @@ class VTKWidget(QWidget):
         self._dynamic_hidden_actor_names.clear()
         self._dynamic_hide_active = False
         self._selected_actor_name = None
+        self._selected_actor_names = []
+        self._highlight_overlay_actors.clear()
 
     def highlight_actor(self, name):
-        if self._selected_actor_name:
-            self._clear_highlight(self._selected_actor_name)
-        self._selected_actor_name = name
-        if name:
+        self.highlight_actors([name] if name else [])
+
+    def highlight_actors(self, names):
+        for selected_name in self._selected_actor_names:
+            self._clear_highlight(selected_name)
+
+        unique_names = []
+        seen = set()
+        for name in names:
+            if not name or name in seen or name not in self._selection_targets:
+                continue
+            unique_names.append(name)
+            seen.add(name)
+
+        self._selected_actor_names = unique_names
+        self._selected_actor_name = unique_names[0] if unique_names else None
+        for name in unique_names:
             self._apply_highlight(name)
         self.render_window.Render()
 
     def reset_camera(self):
-        self.renderer.ResetCamera()
+        self._reset_camera_to_direction((1.0, 0.75, 1.0), (0.0, 1.0, 0.0))
         self.render_window.Render()
 
     def set_view_front(self):
-        camera = self.renderer.GetActiveCamera()
-        camera.SetPosition(0, 0, 1)
-        camera.SetViewUp(0, 1, 0)
-        camera.SetFocalPoint(0, 0, 0)
-        self.renderer.ResetCamera()
+        self._reset_camera_to_direction((0.0, 0.0, 1.0), (0.0, 1.0, 0.0))
         self.render_window.Render()
 
     def set_view_top(self):
-        camera = self.renderer.GetActiveCamera()
-        camera.SetPosition(0, 1, 0)
-        camera.SetViewUp(0, 0, -1)
-        camera.SetFocalPoint(0, 0, 0)
-        self.renderer.ResetCamera()
+        self._reset_camera_to_direction((0.0, 1.0, 0.0), (0.0, 0.0, -1.0))
         self.render_window.Render()
 
     def set_view_right(self):
-        camera = self.renderer.GetActiveCamera()
-        camera.SetPosition(1, 0, 0)
-        camera.SetViewUp(0, 1, 0)
-        camera.SetFocalPoint(0, 0, 0)
-        self.renderer.ResetCamera()
+        self._reset_camera_to_direction((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
         self.render_window.Render()
 
     def set_view_iso(self):
         self.reset_camera()
+
+    def _reset_camera_to_direction(self, direction, view_up):
+        bounds = self._get_scene_model_bounds()
+        if bounds is None:
+            self.renderer.ResetCamera()
+            return
+
+        center, radius = self._bounds_center_radius(bounds)
+        direction = self._normalize_vector(direction)
+        view_angle_rad = math.radians(self.CAMERA_VIEW_ANGLE_DEG)
+        distance = max(
+            radius * self.CAMERA_FRAME_PADDING / math.sin(view_angle_rad / 2.0),
+            1.0,
+        )
+
+        camera = self.renderer.GetActiveCamera()
+        camera.SetViewAngle(self.CAMERA_VIEW_ANGLE_DEG)
+        camera.SetFocalPoint(*center)
+        camera.SetPosition(
+            center[0] + direction[0] * distance,
+            center[1] + direction[1] * distance,
+            center[2] + direction[2] * distance,
+        )
+        camera.SetViewUp(*view_up)
+        self.renderer.ResetCameraClippingRange(bounds)
+        if camera.GetParallelProjection():
+            camera.SetParallelScale(radius * self.CAMERA_FRAME_PADDING)
+
+    def _get_scene_model_bounds(self):
+        visible_bounds = []
+        for actor in self._actors.values():
+            if not actor.GetVisibility():
+                continue
+            bounds = actor.GetBounds()
+            if bounds and bounds[0] <= bounds[1] and bounds[2] <= bounds[3] and bounds[4] <= bounds[5]:
+                visible_bounds.append(bounds)
+
+        if not visible_bounds:
+            return None
+
+        return (
+            min(bounds[0] for bounds in visible_bounds),
+            max(bounds[1] for bounds in visible_bounds),
+            min(bounds[2] for bounds in visible_bounds),
+            max(bounds[3] for bounds in visible_bounds),
+            min(bounds[4] for bounds in visible_bounds),
+            max(bounds[5] for bounds in visible_bounds),
+        )
+
+    def _bounds_center_radius(self, bounds):
+        center = (
+            0.5 * (bounds[0] + bounds[1]),
+            0.5 * (bounds[2] + bounds[3]),
+            0.5 * (bounds[4] + bounds[5]),
+        )
+        radius = 0.5 * math.sqrt(
+            (bounds[1] - bounds[0]) ** 2
+            + (bounds[3] - bounds[2]) ** 2
+            + (bounds[5] - bounds[4]) ** 2
+        )
+        return center, max(radius, 1.0)
+
+    def _normalize_vector(self, vector):
+        length = math.sqrt(sum(component * component for component in vector))
+        if length <= 0.0:
+            return (1.0, 1.0, 1.0)
+        return tuple(component / length for component in vector)
 
     def toggle_wireframe(self, wireframe=True):
         for actor in self._actors.values():
@@ -423,14 +591,25 @@ class VTKWidget(QWidget):
         actor = self._actors.get(base_name)
         if actor is None:
             return
+        overlay_actor = self._create_highlight_overlay_actor(actor, flat_index)
+        if overlay_actor is not None:
+            self._highlight_overlay_actors[selection_name] = overlay_actor
+            self.renderer.AddActor(overlay_actor)
+            return
         if flat_index is None:
             actor.GetProperty().SetEdgeVisibility(True)
             actor.GetProperty().SetEdgeColor(1.0, 0.6, 0.0)
+            actor.GetProperty().SetEdgeOpacity(1.0)
             actor.GetProperty().SetLineWidth(1.5)
             return
         self._set_block_color(actor, flat_index, (1.0, 0.60, 0.0))
 
     def _clear_highlight(self, selection_name):
+        overlay_actor = self._highlight_overlay_actors.pop(selection_name, None)
+        if overlay_actor is not None:
+            self.renderer.RemoveActor(overlay_actor)
+            return
+
         target = self._selection_targets.get(selection_name)
         if not target:
             return
@@ -447,6 +626,72 @@ class VTKWidget(QWidget):
         base_color = self._selection_base_color.get(selection_name)
         if base_color:
             self._set_block_color(actor, flat_index, base_color)
+
+    def _remove_all_highlight_overlays(self):
+        for overlay_actor in self._highlight_overlay_actors.values():
+            self.renderer.RemoveActor(overlay_actor)
+        self._highlight_overlay_actors.clear()
+
+    def _create_highlight_overlay_actor(self, actor, flat_index):
+        data_obj = self._highlight_data_object(actor, flat_index)
+        if data_obj is None:
+            return None
+
+        mapper = self._highlight_mapper_for_data(data_obj)
+        if mapper is None:
+            return None
+
+        overlay_actor = vtk.vtkActor()
+        overlay_actor.SetMapper(mapper)
+        overlay_actor.PickableOff()
+
+        matrix = vtk.vtkMatrix4x4()
+        matrix.DeepCopy(actor.GetMatrix())
+        overlay_actor.SetUserMatrix(matrix)
+
+        prop = overlay_actor.GetProperty()
+        prop.SetColor(1.0, 0.62, 0.0)
+        prop.SetOpacity(1.0)
+        prop.SetRepresentationToWireframe()
+        prop.SetLineWidth(3.0)
+        prop.LightingOff()
+        if hasattr(prop, "SetRenderLinesAsTubes"):
+            prop.SetRenderLinesAsTubes(True)
+        return overlay_actor
+
+    def _highlight_data_object(self, actor, flat_index):
+        mapper = actor.GetMapper()
+        if mapper is None:
+            return None
+        data_obj = mapper.GetInputDataObject(0, 0)
+        if flat_index is None or data_obj is None or not data_obj.IsA("vtkCompositeDataSet"):
+            return data_obj
+
+        iterator = data_obj.NewIterator()
+        iterator.InitTraversal()
+        while not iterator.IsDoneWithTraversal():
+            if iterator.GetCurrentFlatIndex() == flat_index:
+                return iterator.GetCurrentDataObject()
+            iterator.GoToNextItem()
+        return None
+
+    def _highlight_mapper_for_data(self, data_obj):
+        if data_obj is None:
+            return None
+        if data_obj.IsA("vtkPolyData"):
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputData(data_obj)
+        elif data_obj.IsA("vtkCompositeDataSet"):
+            mapper = vtk.vtkCompositePolyDataMapper()
+            mapper.SetInputDataObject(data_obj)
+        elif data_obj.IsA("vtkDataSet"):
+            mapper = vtk.vtkDataSetMapper()
+            mapper.SetInputData(data_obj)
+        else:
+            return None
+        if hasattr(mapper, "SetStatic"):
+            mapper.SetStatic(True)
+        return mapper
 
     def _compute_actor_bounding_sphere(self, actor):
         bounds = actor.GetBounds()
