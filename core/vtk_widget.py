@@ -446,6 +446,9 @@ class VTKWidget(QWidget):
             self._apply_highlight(name)
         self.render_window.Render()
 
+    def highlighted_names(self):
+        return list(self._selected_actor_names)
+
     def reset_camera(self):
         self._reset_camera_to_direction((1.0, 0.75, 1.0), (0.0, 1.0, 0.0))
         self.render_window.Render()
