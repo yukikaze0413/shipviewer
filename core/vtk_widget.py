@@ -2,16 +2,141 @@
 VTK渲染窗口组件
 将VTK渲染器集成到PySide6 QWidget中
 """
+
 import math
 
 import vtk
-from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
+from vtkmodules.qt.QVTKRenderWindowInteractor import (
+    QVTKRenderWindowInteractor,
+    _get_event_pos,
+    EventType,
+    MouseButton,
+)
 from PySide6.QtWidgets import QWidget, QVBoxLayout
 from PySide6.QtCore import Signal
 
 
+class YUpInteractorStyle(vtk.vtkInteractorStyleTerrain):
+    """旧方案：尝试在交互风格层重写按键语义，保留但不再调用。"""
+
+    def OnLeftButtonDown(self):
+        # 左键仅保留给拾取，不进入相机交互
+        return
+
+    def OnLeftButtonUp(self):
+        return
+
+    def OnRightButtonDown(self):
+        # 复用 Terrain 风格的旋转逻辑，但绑定到右键
+        super().OnLeftButtonDown()
+
+    def OnRightButtonUp(self):
+        super().OnLeftButtonUp()
+
+
+class RemappedQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
+    """新方案：在 Qt 事件桥接层直接重映射鼠标语义。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._wheel_delta_remainder = 0
+
+    def mousePressEvent(self, ev):
+        ctrl, shift = self._GetCtrlShift(ev)
+        repeat = 1 if ev.type() == EventType.MouseButtonDblClick else 0
+        x, y = _get_event_pos(ev)
+        self._setEventInformation(x, y, ctrl, shift, chr(0), repeat, None)
+
+        self._ActiveButton = ev.button()
+
+        if self._ActiveButton == MouseButton.LeftButton:
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "_handle_viewport_left_click"):
+                parent._handle_viewport_left_click()
+            ev.accept()
+            return
+
+        if self._ActiveButton == MouseButton.RightButton:
+            self._Iren.LeftButtonPressEvent()
+            return
+
+        if self._ActiveButton == MouseButton.MiddleButton:
+            self._Iren.MiddleButtonPressEvent()
+            return
+
+        super().mousePressEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        ctrl, shift = self._GetCtrlShift(ev)
+        x, y = _get_event_pos(ev)
+        self._setEventInformation(x, y, ctrl, shift, chr(0), 0, None)
+
+        if self._ActiveButton == MouseButton.LeftButton:
+            self._ActiveButton = MouseButton.NoButton
+            ev.accept()
+            return
+
+        if self._ActiveButton == MouseButton.RightButton:
+            self._Iren.LeftButtonReleaseEvent()
+            self._ActiveButton = MouseButton.NoButton
+            return
+
+        if self._ActiveButton == MouseButton.MiddleButton:
+            self._Iren.MiddleButtonReleaseEvent()
+            self._ActiveButton = MouseButton.NoButton
+            return
+
+        super().mouseReleaseEvent(ev)
+
+    def wheelEvent(self, ev):
+        ctrl, shift = self._GetCtrlShift(ev)
+        x, y = _get_event_pos(ev)
+        self._setEventInformation(x, y, ctrl, shift, chr(0), 0, None)
+
+        angle_delta = ev.angleDelta().y() if hasattr(ev, "angleDelta") else 0
+        pixel_delta = ev.pixelDelta().y() if hasattr(ev, "pixelDelta") else 0
+        legacy_delta = ev.delta() if hasattr(ev, "delta") else 0
+
+        parent = self.parent()
+
+        # 优先使用标准滚轮角度增量；若当前输入设备只提供像素级滚动，则直接按方向触发缩放。
+        if angle_delta:
+            self._wheel_delta_remainder += angle_delta
+
+            while self._wheel_delta_remainder >= 120:
+                if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
+                    parent._handle_viewport_wheel(1)
+                else:
+                    self._Iren.MouseWheelForwardEvent()
+                self._wheel_delta_remainder -= 120
+
+            while self._wheel_delta_remainder <= -120:
+                if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
+                    parent._handle_viewport_wheel(-1)
+                else:
+                    self._Iren.MouseWheelBackwardEvent()
+                self._wheel_delta_remainder += 120
+        elif pixel_delta:
+            if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
+                parent._handle_viewport_wheel(1 if pixel_delta > 0 else -1)
+            elif pixel_delta > 0:
+                self._Iren.MouseWheelForwardEvent()
+            else:
+                self._Iren.MouseWheelBackwardEvent()
+        elif legacy_delta:
+            if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
+                parent._handle_viewport_wheel(1 if legacy_delta > 0 else -1)
+            elif legacy_delta > 0:
+                self._Iren.MouseWheelForwardEvent()
+            else:
+                self._Iren.MouseWheelBackwardEvent()
+
+        ev.accept()
+
+
 class VTKWidget(QWidget):
     """基于VTK的3D视口组件 - 极致性能优化版 (针对百万面级模型)"""
+
     LOD_POINT_THRESHOLD = 200_000
     DYNAMIC_HIDE_MIN_ACTOR_COUNT = 800
     DYNAMIC_HIDE_MAX_ANGULAR_SIZE_RAD = 0.01
@@ -27,7 +152,9 @@ class VTKWidget(QWidget):
         self._actors = {}  # base_name -> vtkActor/vtkLODActor
         self._actor_geometry = {}  # name -> (points, cells)
         self._actor_base_color = {}  # base_name -> (r, g, b)
-        self._selection_targets = {}  # sel_name -> (base_name, flat_block_index or None)
+        self._selection_targets = (
+            {}
+        )  # sel_name -> (base_name, flat_block_index or None)
         self._selection_geometry = {}  # sel_name -> (points, cells)
         self._selection_base_color = {}  # sel_name -> (r, g, b)
         self._base_to_flat_alias = {}  # base_name -> {flat_block_index: sel_name}
@@ -41,6 +168,8 @@ class VTKWidget(QWidget):
         self._skybox_actor = None
         self._dynamic_hidden_actor_names = set()
         self._dynamic_hide_active = False
+        self._camera_debug_annotation = None
+        self._camera_debug_overlay_visible = False
         self._setup_ui()
         self._setup_vtk()
 
@@ -48,18 +177,18 @@ class VTKWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self.vtk_widget = QVTKRenderWindowInteractor(self)
+        self.vtk_widget = RemappedQVTKRenderWindowInteractor(self)
         layout.addWidget(self.vtk_widget)
 
     def _setup_vtk(self):
         self.render_window = self.vtk_widget.GetRenderWindow()
-        
+
         # 优化1：对于超大模型，关闭抗锯齿或保持极低
-        self.render_window.SetMultiSamples(0) 
+        self.render_window.SetMultiSamples(0)
 
         self.renderer = vtk.vtkRenderer()
-        self.renderer.SetBackground(0.12, 0.13, 0.16)   
-        self.renderer.SetBackground2(0.18, 0.20, 0.24)   
+        self.renderer.SetBackground(0.12, 0.13, 0.16)
+        self.renderer.SetBackground2(0.18, 0.20, 0.24)
         self.renderer.GradientBackgroundOn()
         self.render_window.AddRenderer(self.renderer)
 
@@ -67,20 +196,27 @@ class VTKWidget(QWidget):
         # 当进行旋转等交互时，VTK会尝试通过 LOD 切换来维持这个更新率
         self.interactor = self.render_window.GetInteractor()
         self.interactor.SetDesiredUpdateRate(30.0)  # 交互时尽量提高流畅度
-        self.interactor.SetStillUpdateRate(1.0)     # 静止时维持低频更新
+        self.interactor.SetStillUpdateRate(1.0)  # 静止时维持低频更新
 
-        style = vtk.vtkInteractorStyleTrackballCamera()
+        # 新方案在 Qt 事件桥接层改按键语义，因此这里使用 VTK 原生 Terrain 风格即可。
+        # 旧的 YUpInteractorStyle 方案保留在文件中，但不再启用。
+        style = vtk.vtkInteractorStyleTerrain()
         self.interactor.SetInteractorStyle(style)
 
         self.picker = vtk.vtkCellPicker()
         self.picker.SetTolerance(0.0005)
-        self.interactor.AddObserver("LeftButtonPressEvent", self._on_left_button_press, -1.0)
-        self.interactor.AddObserver("StartInteractionEvent", self._on_start_interaction, 1.0)
-        self.interactor.AddObserver("EndInteractionEvent", self._on_end_interaction, 1.0)
+        self.interactor.AddObserver(
+            "StartInteractionEvent", self._on_start_interaction, 1.0
+        )
+        self.interactor.AddObserver(
+            "EndInteractionEvent", self._on_end_interaction, 1.0
+        )
+        self.render_window.AddObserver("StartEvent", self._on_render_start, 1.0)
 
         self._add_axes_widget()
         self._add_grid_floor()
         self._setup_lighting()
+        self._setup_camera_debug_overlay()
 
     def set_background_image(self, filepath):
         if filepath.lower().endswith((".hdr", ".pic")):
@@ -155,6 +291,87 @@ class VTKWidget(QWidget):
         fill_light.SetIntensity(0.3)
         self.renderer.AddLight(fill_light)
 
+    def _setup_camera_debug_overlay(self):
+        annotation = vtk.vtkCornerAnnotation()
+        annotation.SetText(vtk.vtkCornerAnnotation.UpperRight, "")
+        annotation.SetMaximumFontSize(18)
+        annotation.SetLinearFontScaleFactor(2.0)
+        annotation.SetNonlinearFontScaleFactor(1.0)
+
+        text_prop = annotation.GetTextProperty()
+        text_prop.SetColor(0.95, 0.97, 0.99)
+        text_prop.SetBackgroundColor(0.07, 0.08, 0.10)
+        text_prop.SetBackgroundOpacity(0.78)
+        text_prop.FrameOn()
+        text_prop.SetFrameColor(0.32, 0.36, 0.42)
+        text_prop.SetFrameWidth(1)
+        text_prop.BoldOff()
+        text_prop.ShadowOff()
+
+        annotation.VisibilityOff()
+        self._camera_debug_annotation = annotation
+        self.renderer.AddViewProp(annotation)
+
+    def _on_render_start(self, obj, event):
+        self._update_camera_debug_overlay()
+
+    def _format_vector(self, vector):
+        return f"({vector[0]:+.4f}, {vector[1]:+.4f}, {vector[2]:+.4f})"
+
+    def _update_camera_debug_overlay(self):
+        if (
+            not self._camera_debug_overlay_visible
+            or self._camera_debug_annotation is None
+        ):
+            return
+
+        camera = self.renderer.GetActiveCamera()
+        if camera is None:
+            self._camera_debug_annotation.SetText(
+                vtk.vtkCornerAnnotation.UpperRight,
+                "相机调试\n无活动相机",
+            )
+            return
+
+        position = camera.GetPosition()
+        focal_point = camera.GetFocalPoint()
+        direction = self._normalize_vector(
+            (
+                position[0] - focal_point[0],
+                position[1] - focal_point[1],
+                position[2] - focal_point[2],
+            )
+        )
+        view_up = self._normalize_vector(camera.GetViewUp())
+
+        debug_text = (
+            "相机调试\n"
+            f"direction (center→camera): {self._format_vector(direction)}\n"
+            f"view_up (screen↑): {self._format_vector(view_up)}"
+        )
+        self._camera_debug_annotation.SetText(
+            vtk.vtkCornerAnnotation.UpperRight,
+            debug_text,
+        )
+
+    def set_camera_debug_overlay_visible(self, visible=True):
+        self._camera_debug_overlay_visible = bool(visible)
+        if self._camera_debug_annotation is None:
+            return
+
+        if self._camera_debug_overlay_visible:
+            self._update_camera_debug_overlay()
+            self._camera_debug_annotation.VisibilityOn()
+        else:
+            self._camera_debug_annotation.VisibilityOff()
+
+        self.render_window.Render()
+
+    def toggle_camera_debug_overlay(self, visible=None):
+        if visible is None:
+            visible = not self._camera_debug_overlay_visible
+        self.set_camera_debug_overlay_visible(visible)
+
     def _add_axes_widget(self):
         axes = vtk.vtkAxesActor()
         axes.SetTotalLength(1.0, 1.0, 1.0)
@@ -195,7 +412,10 @@ class VTKWidget(QWidget):
         self.grid_actor.GetProperty().SetOpacity(0.2)
         self.renderer.AddActor(self.grid_actor)
 
-    def _on_left_button_press(self, obj, event):
+    def _handle_viewport_left_click(self):
+        # 取 VTK 交互器中的显示坐标，而不是直接使用 Qt 原始鼠标坐标。
+        # 新方案在桥接层已经通过 _setEventInformation() 做过像素比缩放与 Y 轴翻转；
+        # 若这里继续拿 Qt 坐标去 Pick，会导致拾取射线起点落在错误的屏幕位置。
         click_pos = self.interactor.GetEventPosition()
         self.picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
         actor = self.picker.GetActor()
@@ -207,8 +427,35 @@ class VTKWidget(QWidget):
                     break
         self.model_clicked.emit(clicked_name)
 
+    def _handle_viewport_wheel(self, direction):
+        camera = self.renderer.GetActiveCamera()
+        if camera is None:
+            return
+
+        zoom_factor = 1.2
+        if camera.GetParallelProjection():
+            scale = camera.GetParallelScale()
+            if direction > 0:
+                camera.SetParallelScale(max(scale / zoom_factor, 1e-6))
+            else:
+                camera.SetParallelScale(scale * zoom_factor)
+        else:
+            if direction > 0:
+                camera.Dolly(zoom_factor)
+            else:
+                camera.Dolly(1.0 / zoom_factor)
+
+        self.renderer.ResetCameraClippingRange()
+        self.render_window.Render()
+
+    def _on_left_button_press(self, obj, event):
+        # 旧方案保留：如果未来重新启用 VTK 左键事件拾取，可继续复用该入口。
+        self._handle_viewport_left_click()
+
     def _selection_name_for_pick(self, base_name):
-        dataset = self.picker.GetDataSet() if hasattr(self.picker, "GetDataSet") else None
+        dataset = (
+            self.picker.GetDataSet() if hasattr(self.picker, "GetDataSet") else None
+        )
         dataset_ptr = getattr(dataset, "__this__", "") if dataset is not None else ""
         if dataset_ptr:
             alias_name = self._base_to_dataset_alias.get(base_name, {}).get(dataset_ptr)
@@ -329,8 +576,7 @@ class VTKWidget(QWidget):
         has_texture = self._actor_has_any_texture(actor)
         use_lod = (
             add_to_renderer
-            and
-            mapper is not None
+            and mapper is not None
             and data_obj is not None
             and not has_texture
             and data_obj.IsA("vtkPolyData")
@@ -376,9 +622,13 @@ class VTKWidget(QWidget):
         self._selection_geometry[alias_name] = (points, cells)
         if base_color is not None:
             self._selection_base_color[alias_name] = tuple(base_color)
-        self._base_to_flat_alias.setdefault(base_name, {})[flat_block_index] = alias_name
+        self._base_to_flat_alias.setdefault(base_name, {})[
+            flat_block_index
+        ] = alias_name
         if dataset_ptr:
-            self._base_to_dataset_alias.setdefault(base_name, {})[dataset_ptr] = alias_name
+            self._base_to_dataset_alias.setdefault(base_name, {})[
+                dataset_ptr
+            ] = alias_name
 
     def remove_actor(self, name):
         if name in self._actors:
@@ -395,7 +645,11 @@ class VTKWidget(QWidget):
                     for selected_name in self._selected_actor_names
                     if selected_name not in selected_names
                 ]
-                self._selected_actor_name = self._selected_actor_names[0] if self._selected_actor_names else None
+                self._selected_actor_name = (
+                    self._selected_actor_names[0]
+                    if self._selected_actor_names
+                    else None
+                )
             self.renderer.RemoveActor(self._actors[name])
             del self._actors[name]
             self._actor_geometry.pop(name, None)
@@ -447,7 +701,7 @@ class VTKWidget(QWidget):
         self.render_window.Render()
 
     def reset_camera(self):
-        self._reset_camera_to_direction((1.0, 0.75, 1.0), (0.0, 1.0, 0.0))
+        self._reset_camera_to_direction((1.0, 1.0, 1.0), (0.0, 1.0, 0.0))
         self.render_window.Render()
 
     def set_view_front(self):
@@ -455,7 +709,9 @@ class VTKWidget(QWidget):
         self.render_window.Render()
 
     def set_view_top(self):
-        self._reset_camera_to_direction((0.0, 1.0, 0.0), (0.0, 0.0, -1.0))
+        # 严格 0 度俯视：视线沿世界 Y 轴，去掉之前的小角度倾斜。
+        # 这会保持俯视方向稳定，避免按钮切换时出现额外滚转。
+        self._reset_camera_to_direction((0.0, 0.9998, 0.0209), (0.0, 1.0, 0.0))
         self.render_window.Render()
 
     def set_view_right(self):
@@ -488,6 +744,8 @@ class VTKWidget(QWidget):
             center[2] + direction[2] * distance,
         )
         camera.SetViewUp(*view_up)
+        # camera.OrthogonalizeViewUp()
+        camera.SetRoll(0.0)
         self.renderer.ResetCameraClippingRange(bounds)
         if camera.GetParallelProjection():
             camera.SetParallelScale(radius * self.CAMERA_FRAME_PADDING)
@@ -498,7 +756,12 @@ class VTKWidget(QWidget):
             if not actor.GetVisibility():
                 continue
             bounds = actor.GetBounds()
-            if bounds and bounds[0] <= bounds[1] and bounds[2] <= bounds[3] and bounds[4] <= bounds[5]:
+            if (
+                bounds
+                and bounds[0] <= bounds[1]
+                and bounds[2] <= bounds[3]
+                and bounds[4] <= bounds[5]
+            ):
                 visible_bounds.append(bounds)
 
         if not visible_bounds:
@@ -529,7 +792,7 @@ class VTKWidget(QWidget):
     def _normalize_vector(self, vector):
         length = math.sqrt(sum(component * component for component in vector))
         if length <= 0.0:
-            return (1.0, 1.0, 1.0)
+            return (0.0, 1.0, 0.0)
         return tuple(component / length for component in vector)
 
     def toggle_wireframe(self, wireframe=True):
@@ -556,7 +819,9 @@ class VTKWidget(QWidget):
             return None
         mapper = actor.GetMapper()
         if mapper:
-            points, cells = self._selection_geometry.get(name, self._actor_geometry.get(base_name, (0, 0)))
+            points, cells = self._selection_geometry.get(
+                name, self._actor_geometry.get(base_name, (0, 0))
+            )
             bounds = actor.GetBounds()
             info = {
                 "顶点数": points,
@@ -569,7 +834,9 @@ class VTKWidget(QWidget):
         return None
 
     def _remove_selection_entries_for_base(self, base_name):
-        keys_to_remove = [key for key, val in self._selection_targets.items() if val[0] == base_name]
+        keys_to_remove = [
+            key for key, val in self._selection_targets.items() if val[0] == base_name
+        ]
         for key in keys_to_remove:
             self._selection_targets.pop(key, None)
             self._selection_geometry.pop(key, None)
@@ -664,7 +931,11 @@ class VTKWidget(QWidget):
         if mapper is None:
             return None
         data_obj = mapper.GetInputDataObject(0, 0)
-        if flat_index is None or data_obj is None or not data_obj.IsA("vtkCompositeDataSet"):
+        if (
+            flat_index is None
+            or data_obj is None
+            or not data_obj.IsA("vtkCompositeDataSet")
+        ):
             return data_obj
 
         iterator = data_obj.NewIterator()
@@ -719,7 +990,9 @@ class VTKWidget(QWidget):
             iterator = data_obj.NewIterator()
             iterator.InitTraversal()
             while not iterator.IsDoneWithTraversal():
-                points, cells = self._count_data_object_geometry(iterator.GetCurrentDataObject())
+                points, cells = self._count_data_object_geometry(
+                    iterator.GetCurrentDataObject()
+                )
                 total_points += points
                 total_cells += cells
                 iterator.GoToNextItem()

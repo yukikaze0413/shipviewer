@@ -2,6 +2,7 @@
 主窗口控制器
 管理菜单、工具栏、停靠面板和3D视口
 """
+
 import csv
 import json
 import os
@@ -11,12 +12,27 @@ from collections import defaultdict
 import vtk
 
 from PySide6.QtWidgets import (
-    QMainWindow, QDockWidget, QTreeWidget, QTreeWidgetItem,
-    QTableWidget, QTableWidgetItem,
-    QToolBar, QStatusBar, QFileDialog, QMessageBox,
-    QProgressBar, QLabel, QVBoxLayout, QHBoxLayout,
-    QWidget, QMenu, QMenuBar, QStackedWidget,
-    QGroupBox, QPushButton, QAbstractItemView,
+    QMainWindow,
+    QDockWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolBar,
+    QStatusBar,
+    QFileDialog,
+    QMessageBox,
+    QProgressBar,
+    QLabel,
+    QVBoxLayout,
+    QHBoxLayout,
+    QWidget,
+    QMenu,
+    QMenuBar,
+    QStackedWidget,
+    QGroupBox,
+    QPushButton,
+    QAbstractItemView,
 )
 from PySide6.QtCore import Qt, QSize, QTimer, QUrl
 from PySide6.QtGui import QAction, QKeySequence, QDesktopServices
@@ -58,8 +74,12 @@ class MainWindow(QMainWindow):
         self._loaded_items = []
         self._is_wireframe = False
         self._project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self._damage_tree_csv_path = os.path.join(self._project_root, "damage-tree-nodes.csv")
-        self._pdf_catalog_csv_path = os.path.join(self._project_root, "part-pdf-catalog.csv")
+        self._damage_tree_csv_path = os.path.join(
+            self._project_root, "damage-tree-nodes.csv"
+        )
+        self._pdf_catalog_csv_path = os.path.join(
+            self._project_root, "part-pdf-catalog.csv"
+        )
         self._viewport_background_path = os.path.join(
             self._project_root,
             "assets",
@@ -182,6 +202,14 @@ class MainWindow(QMainWindow):
         self.action_grid.toggled.connect(self.vtk_widget.toggle_grid)
         view_menu.addAction(self.action_grid)
 
+        self.action_camera_debug = QAction("显示相机调试框", self)
+        self.action_camera_debug.setCheckable(True)
+        self.action_camera_debug.setChecked(False)
+        self.action_camera_debug.toggled.connect(
+            self.vtk_widget.toggle_camera_debug_overlay
+        )
+        view_menu.addAction(self.action_camera_debug)
+
         # === 窗口菜单 ===
         window_menu = menubar.addMenu("窗口(&W)")
         self.action_show_tree = QAction("损伤树", self)
@@ -251,6 +279,14 @@ class MainWindow(QMainWindow):
         self.btn_wireframe.setToolTip("线框模式 (W)")
         self.btn_wireframe.toggled.connect(self._toggle_wireframe)
         toolbar.addAction(self.btn_wireframe)
+
+        btn_camera_debug = QAction("🧭 调试", self)
+        btn_camera_debug.setCheckable(True)
+        btn_camera_debug.setToolTip("显示相机 direction / view_up 调试框")
+        btn_camera_debug.toggled.connect(self.vtk_widget.toggle_camera_debug_overlay)
+        btn_camera_debug.toggled.connect(self.action_camera_debug.setChecked)
+        self.action_camera_debug.toggled.connect(btn_camera_debug.setChecked)
+        toolbar.addAction(btn_camera_debug)
 
         toolbar.addSeparator()
 
@@ -326,7 +362,9 @@ class MainWindow(QMainWindow):
         self.selection_title_label = QLabel("未选择对象或损伤节点")
         self.selection_title_label.setObjectName("accentLabel")
         self.selection_title_label.setWordWrap(True)
-        self.selection_meta_label = QLabel("请选择模型中的 object，或点击左侧损伤树节点。")
+        self.selection_meta_label = QLabel(
+            "请选择模型中的 object，或点击左侧损伤树节点。"
+        )
         self.selection_meta_label.setWordWrap(True)
 
         self.catalog_table = QTableWidget()
@@ -431,7 +469,9 @@ class MainWindow(QMainWindow):
         self._pdf_catalog_by_damage_leaf_id.clear()
 
         if not os.path.exists(csv_path):
-            self._set_document_message(f"未找到文档目录文件: {os.path.basename(csv_path)}")
+            self._set_document_message(
+                f"未找到文档目录文件: {os.path.basename(csv_path)}"
+            )
             return
 
         try:
@@ -471,12 +511,16 @@ class MainWindow(QMainWindow):
                         display_name = cols[1].strip()
                         document_path = cols[2].strip()
                         damage_leaf_id = cols[3].strip()
-                        if not any((model_name, display_name, document_path, damage_leaf_id)):
+                        if not any(
+                            (model_name, display_name, document_path, damage_leaf_id)
+                        ):
                             continue
                         rows.append(
                             {
                                 "model_name": model_name,
-                                "display_name": display_name or model_name or damage_leaf_id,
+                                "display_name": display_name
+                                or model_name
+                                or damage_leaf_id,
                                 "document_path": document_path,
                                 "damage_leaf_id": damage_leaf_id,
                                 "row_number": idx,
@@ -506,7 +550,9 @@ class MainWindow(QMainWindow):
             return os.path.normpath(raw_path)
 
         if not os.path.dirname(raw_path):
-            pdfs_path = os.path.normpath(os.path.join(self._project_root, "pdfs", raw_path))
+            pdfs_path = os.path.normpath(
+                os.path.join(self._project_root, "pdfs", raw_path)
+            )
             if os.path.exists(pdfs_path):
                 return pdfs_path
 
@@ -514,7 +560,9 @@ class MainWindow(QMainWindow):
         if os.path.exists(project_path):
             return project_path
 
-        pdfs_path = os.path.normpath(os.path.join(self._project_root, "pdfs", os.path.basename(raw_path)))
+        pdfs_path = os.path.normpath(
+            os.path.join(self._project_root, "pdfs", os.path.basename(raw_path))
+        )
         if os.path.exists(pdfs_path):
             return pdfs_path
 
@@ -620,7 +668,9 @@ class MainWindow(QMainWindow):
             raise last_error
         return []
 
-    def _create_damage_tree_item(self, node, parent_item, nodes_by_id, children_map, level, lineage):
+    def _create_damage_tree_item(
+        self, node, parent_item, nodes_by_id, children_map, level, lineage
+    ):
         item = QTreeWidgetItem(parent_item or self.model_tree)
         node_id = node["node_id"]
         parent_id = node["parent_id"]
@@ -674,10 +724,7 @@ class MainWindow(QMainWindow):
     def open_file(self):
         """打开文件对话框"""
         filepath, _ = QFileDialog.getOpenFileName(
-            self,
-            "打开模型文件",
-            "",
-            get_supported_formats()
+            self, "打开模型文件", "", get_supported_formats()
         )
         if filepath:
             self._load_model(filepath)
@@ -750,16 +797,25 @@ class MainWindow(QMainWindow):
                 self._optimize_actor_texture(actor, max_texture_size=texture_max_size)
                 self._optimize_actor_material_for_speed(actor)
                 points, cells = self._get_actor_geometry_stats(actor)
-                imported_actors.append((actor, points, cells, self._vtk_object_name(actor)))
+                imported_actors.append(
+                    (actor, points, cells, self._vtk_object_name(actor))
+                )
 
             display_names = self._match_gltf_display_names(
                 gltf_name_entries,
-                [(points, cells) for _actor, points, cells, _actor_object_name in imported_actors],
+                [
+                    (points, cells)
+                    for _actor, points, cells, _actor_object_name in imported_actors
+                ],
             )
 
             for actor, points, cells, actor_object_name in imported_actors:
                 actor_name = f"actor_{actor_index}"
-                matched_name = display_names[actor_index] if actor_index < len(display_names) else ""
+                matched_name = (
+                    display_names[actor_index]
+                    if actor_index < len(display_names)
+                    else ""
+                )
                 original_name = self._original_display_name(
                     actor_object_name or matched_name,
                     f"Object_{actor_index}",
@@ -776,13 +832,15 @@ class MainWindow(QMainWindow):
                 total_verts += points
                 total_faces += cells
                 object_count += 1
-                self._loaded_items.append({
-                    "actor": actor,
-                    "name": original_name,
-                    "type": "Mesh",
-                    "points": points,
-                    "cells": cells,
-                })
+                self._loaded_items.append(
+                    {
+                        "actor": actor,
+                        "name": original_name,
+                        "type": "Mesh",
+                        "points": points,
+                        "cells": cells,
+                    }
+                )
                 actor_index += 1
 
             self.vtk_widget.reset_camera()
@@ -794,7 +852,9 @@ class MainWindow(QMainWindow):
                 return
 
             if textured_count == 0:
-                self.status_label.setText(f"✓ 成功加载 {object_count} 个对象（该模型不含贴图）")
+                self.status_label.setText(
+                    f"✓ 成功加载 {object_count} 个对象（该模型不含贴图）"
+                )
             else:
                 self.status_label.setText(
                     f"✓ 成功加载 {object_count} 个对象（贴图对象: {textured_count}，贴图上限: {texture_max_size}px）"
@@ -839,7 +899,11 @@ class MainWindow(QMainWindow):
             return meshes[mesh_idx].get("primitives") or []
 
         def accessor_count(accessor_idx):
-            if not isinstance(accessor_idx, int) or accessor_idx < 0 or accessor_idx >= len(accessors):
+            if (
+                not isinstance(accessor_idx, int)
+                or accessor_idx < 0
+                or accessor_idx >= len(accessors)
+            ):
                 return 0
             return int(accessors[accessor_idx].get("count") or 0)
 
@@ -878,16 +942,20 @@ class MainWindow(QMainWindow):
                     points, cells = primitive_geometry(primitive)
                     node_points += points
                     node_cells += cells
-                    primitive_entries.append({
+                    primitive_entries.append(
+                        {
+                            "name": display_name,
+                            "points": points,
+                            "cells": cells,
+                        }
+                    )
+                node_entries.append(
+                    {
                         "name": display_name,
-                        "points": points,
-                        "cells": cells,
-                    })
-                node_entries.append({
-                    "name": display_name,
-                    "points": node_points,
-                    "cells": node_cells,
-                })
+                        "points": node_points,
+                        "cells": node_cells,
+                    }
+                )
 
             for child_idx in node.get("children") or []:
                 visit(child_idx)
@@ -924,7 +992,9 @@ class MainWindow(QMainWindow):
         else:
             ordered_entries = node_entries or primitive_entries
 
-        match_entries = self._dedupe_gltf_match_entries([*node_entries, *primitive_entries])
+        match_entries = self._dedupe_gltf_match_entries(
+            [*node_entries, *primitive_entries]
+        )
         display_names = [None] * len(actor_stats)
         used_entry_indexes = set()
 
@@ -1102,7 +1172,9 @@ class MainWindow(QMainWindow):
             self.vtk_widget.highlight_actor("")
             self._update_geo_info_all(0, 0, self._get_loaded_object_count())
             self.selection_title_label.setText("未选择对象或损伤节点")
-            self.selection_meta_label.setText("请选择模型中的 object，或点击左侧损伤树节点。")
+            self.selection_meta_label.setText(
+                "请选择模型中的 object，或点击左侧损伤树节点。"
+            )
             self.catalog_table.setRowCount(0)
             self._current_catalog_matches = []
             self._set_document_message("未选择文档")
@@ -1142,7 +1214,9 @@ class MainWindow(QMainWindow):
             highlighted_names = self._selection_names_for_catalog_rows(matches)
             self.vtk_widget.highlight_actors(highlighted_names)
 
-            highlight_text = f"  |  高亮对象: {len(highlighted_names)}" if highlighted_names else ""
+            highlight_text = (
+                f"  |  高亮对象: {len(highlighted_names)}" if highlighted_names else ""
+            )
             self.status_label.setText(
                 f"损伤节点: {item.text(0)}  |  节点ID: {node_id}  |  上级ID: {parent_id}  |  下级: {item.childCount()}{highlight_text}"
             )
@@ -1180,7 +1254,9 @@ class MainWindow(QMainWindow):
         selection_names = []
         seen = set()
         for row in rows:
-            for selection_name in self._selection_names_for_catalog_key(row.get("model_name", "")):
+            for selection_name in self._selection_names_for_catalog_key(
+                row.get("model_name", "")
+            ):
                 if selection_name in seen:
                     continue
                 selection_names.append(selection_name)
@@ -1241,7 +1317,9 @@ class MainWindow(QMainWindow):
 
         return mapped_name or actor_name
 
-    def _show_catalog_matches(self, source_type, source_key, display_name, matches, meta=""):
+    def _show_catalog_matches(
+        self, source_type, source_key, display_name, matches, meta=""
+    ):
         self.selection_title_label.setText(display_name)
         lookup_label = "模型名称" if source_type == "model" else "毁伤叶子ID"
         self.selection_meta_label.setText(meta or f"{lookup_label}: {source_key}")
@@ -1250,7 +1328,9 @@ class MainWindow(QMainWindow):
         self.catalog_table.blockSignals(True)
         self.catalog_table.setRowCount(len(self._current_catalog_matches))
         for row_idx, row in enumerate(self._current_catalog_matches):
-            match_id = row["model_name"] if source_type == "model" else row["damage_leaf_id"]
+            match_id = (
+                row["model_name"] if source_type == "model" else row["damage_leaf_id"]
+            )
             values = (
                 row["display_name"],
                 match_id or source_key,
@@ -1267,7 +1347,9 @@ class MainWindow(QMainWindow):
             self._display_catalog_row(0)
             return
 
-        self._set_document_message(f"未在文档目录中找到匹配项: {lookup_label} = {source_key}")
+        self._set_document_message(
+            f"未在文档目录中找到匹配项: {lookup_label} = {source_key}"
+        )
 
     def _on_catalog_row_clicked(self, row, column):
         self._display_catalog_row(row)
@@ -1302,15 +1384,21 @@ class MainWindow(QMainWindow):
 
         if ext == ".pdf":
             if self.pdf_document is None or self.pdf_view is None:
-                self._show_document_message(f"已匹配 PDF，但当前 PySide6 环境未启用 QtPdf。\n{resolved_path}")
+                self._show_document_message(
+                    f"已匹配 PDF，但当前 PySide6 环境未启用 QtPdf。\n{resolved_path}"
+                )
                 self.document_status_label.setText(f"无法预览: {title} ({filename})")
                 return
 
             self.pdf_document.close()
             error = self.pdf_document.load(resolved_path)
             if error != QPdfDocument.Error.None_:
-                self._show_document_message(f"PDF 加载失败: {error.name}\n{resolved_path}")
-                self.document_status_label.setText(f"PDF 加载失败: {title} ({filename})")
+                self._show_document_message(
+                    f"PDF 加载失败: {error.name}\n{resolved_path}"
+                )
+                self.document_status_label.setText(
+                    f"PDF 加载失败: {title} ({filename})"
+                )
                 return
 
             self.document_view.setCurrentWidget(self.pdf_view)
@@ -1318,7 +1406,9 @@ class MainWindow(QMainWindow):
             return
 
         if self.web_document_view is None:
-            self._show_document_message(f"已匹配文档，但当前 PySide6 环境未启用 QtWebEngine。\n{resolved_path}")
+            self._show_document_message(
+                f"已匹配文档，但当前 PySide6 环境未启用 QtWebEngine。\n{resolved_path}"
+            )
             self.document_status_label.setText(f"无法预览: {title} ({filename})")
             return
 
@@ -1357,7 +1447,9 @@ class MainWindow(QMainWindow):
         self.catalog_table.setRowCount(0)
         self._current_catalog_matches = []
         self.selection_title_label.setText("未选择对象或损伤节点")
-        self.selection_meta_label.setText("请选择模型中的 object，或点击左侧损伤树节点。")
+        self.selection_meta_label.setText(
+            "请选择模型中的 object，或点击左侧损伤树节点。"
+        )
         self._set_document_message("未选择文档")
         self.vertex_label.setText("")
         self.status_label.setText("场景已清空")
@@ -1499,7 +1591,9 @@ class MainWindow(QMainWindow):
             iterator = data_obj.NewIterator()
             iterator.InitTraversal()
             while not iterator.IsDoneWithTraversal():
-                points, cells = self._count_data_object_geometry(iterator.GetCurrentDataObject())
+                points, cells = self._count_data_object_geometry(
+                    iterator.GetCurrentDataObject()
+                )
                 total_points += points
                 total_cells += cells
                 iterator.GoToNextItem()
@@ -1544,7 +1638,7 @@ class MainWindow(QMainWindow):
             "<li>R - 重置视角</li>"
             "<li>W - 线框模式</li>"
             "<li>G - 显示/隐藏网格</li>"
-            "</ul>"
+            "</ul>",
         )
 
     # ============================================================
