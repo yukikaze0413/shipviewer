@@ -17,3 +17,7 @@ Thumbs.db
 *.glb
 *.gltf
 *.bin
+
+# bat files
+*.bat
+*.ps1
