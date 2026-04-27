@@ -89,6 +89,9 @@ class MainWindow(QMainWindow):
         self._pdf_catalog_rows = []
         self._pdf_catalog_by_model_name = defaultdict(list)
         self._pdf_catalog_by_damage_leaf_id = defaultdict(list)
+        self._damage_nodes_by_id = {}
+        self._damage_children_by_id = defaultdict(list)
+        self._damage_node_ids = set()
         self._current_catalog_matches = []
         self._current_document_path = None
         self._actor_catalog_names = {}
@@ -427,6 +430,9 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("就绪")
         self.status_bar.addWidget(self.status_label, 1)
 
+        self.highlight_debug_label = QLabel("实际高亮: 无")
+        self.status_bar.addPermanentWidget(self.highlight_debug_label)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setFixedWidth(200)
         self.progress_bar.setVisible(False)
@@ -488,8 +494,6 @@ class MainWindow(QMainWindow):
                 self._pdf_catalog_by_model_name[model_name].append(row)
             if damage_leaf_id:
                 self._pdf_catalog_by_damage_leaf_id[damage_leaf_id].append(row)
-            elif model_name:
-                self._pdf_catalog_by_damage_leaf_id[model_name].append(row)
 
         if not rows:
             self._set_document_message("文档目录为空。")
@@ -605,6 +609,11 @@ class MainWindow(QMainWindow):
         for child_list in children_map.values():
             child_list.sort(key=sort_key)
         root_nodes.sort(key=sort_key)
+        self._damage_nodes_by_id = dict(nodes_by_id)
+        self._damage_children_by_id = defaultdict(
+            list, {key: list(value) for key, value in children_map.items()}
+        )
+        self._damage_node_ids = set(nodes_by_id)
 
         self.model_tree.blockSignals(True)
         self.model_tree.clear()
@@ -798,18 +807,24 @@ class MainWindow(QMainWindow):
                 self._optimize_actor_material_for_speed(actor)
                 points, cells = self._get_actor_geometry_stats(actor)
                 imported_actors.append(
-                    (actor, points, cells, self._vtk_object_name(actor))
+                    (
+                        actor,
+                        points,
+                        cells,
+                        self._vtk_object_name(actor),
+                        actor.GetBounds(),
+                    )
                 )
 
             display_names = self._match_gltf_display_names(
                 gltf_name_entries,
                 [
-                    (points, cells)
-                    for _actor, points, cells, _actor_object_name in imported_actors
+                    (points, cells, bounds)
+                    for _actor, points, cells, _actor_object_name, bounds in imported_actors
                 ],
             )
 
-            for actor, points, cells, actor_object_name in imported_actors:
+            for actor, points, cells, actor_object_name, _bounds in imported_actors:
                 actor_name = f"actor_{actor_index}"
                 matched_name = (
                     display_names[actor_index]
@@ -818,12 +833,11 @@ class MainWindow(QMainWindow):
                 )
                 original_name = self._original_display_name(
                     actor_object_name or matched_name,
-                    f"Object_{actor_index}",
+                    actor_name,
                 )
                 catalog_name = self._best_catalog_name(
                     original_name,
                     matched_name,
-                    f"Object_{actor_index}",
                 )
                 self.vtk_widget.add_actor(actor, actor_name, add_to_renderer=False)
                 self._actor_catalog_names[actor_name] = catalog_name
@@ -977,7 +991,53 @@ class MainWindow(QMainWindow):
             if node_idx not in visited and node_primitives(node):
                 visit(node_idx)
 
-        return {"primitive": primitive_entries, "node": node_entries}
+        name_entries = {"primitive": primitive_entries, "node": node_entries}
+        self._attach_gltf_reader_bounds(filepath, name_entries)
+        return name_entries
+
+    def _attach_gltf_reader_bounds(self, filepath, name_entries):
+        reader_entries = self._read_gltf_reader_geometry_entries(filepath)
+        if not reader_entries:
+            return
+
+        for entry_key in ("node", "primitive"):
+            entries = name_entries.get(entry_key) or []
+            if len(entries) != len(reader_entries):
+                continue
+            for entry, reader_entry in zip(entries, reader_entries):
+                if entry.get("points") == reader_entry.get("points") and entry.get(
+                    "cells"
+                ) == reader_entry.get("cells"):
+                    entry["bounds"] = reader_entry.get("bounds")
+            return
+
+    def _read_gltf_reader_geometry_entries(self, filepath):
+        try:
+            reader = vtk.vtkGLTFReader()
+            reader.SetFileName(filepath)
+            reader.Update()
+            data_obj = reader.GetOutput()
+        except Exception:
+            return []
+
+        if data_obj is None or not data_obj.IsA("vtkCompositeDataSet"):
+            return []
+
+        entries = []
+        iterator = data_obj.NewIterator()
+        iterator.InitTraversal()
+        while not iterator.IsDoneWithTraversal():
+            current = iterator.GetCurrentDataObject()
+            if current is not None and current.IsA("vtkPolyData"):
+                entries.append(
+                    {
+                        "points": current.GetNumberOfPoints(),
+                        "cells": current.GetNumberOfCells(),
+                        "bounds": tuple(current.GetBounds()),
+                    }
+                )
+            iterator.GoToNextItem()
+        return entries
 
     def _match_gltf_display_names(self, name_entries, actor_stats):
         primitive_entries = list(name_entries.get("primitive") or [])
@@ -998,7 +1058,8 @@ class MainWindow(QMainWindow):
         display_names = [None] * len(actor_stats)
         used_entry_indexes = set()
 
-        for actor_idx, (points, cells) in enumerate(actor_stats):
+        for actor_idx, actor_stat in enumerate(actor_stats):
+            points, cells, bounds = self._normalize_actor_match_stat(actor_stat)
             exact_indexes = [
                 entry_idx
                 for entry_idx, entry in enumerate(match_entries)
@@ -1006,14 +1067,17 @@ class MainWindow(QMainWindow):
                 and entry.get("points") == points
                 and entry.get("cells") == cells
             ]
-            if len(exact_indexes) == 1:
-                entry_idx = exact_indexes[0]
+            entry_idx = self._best_gltf_match_entry_index(
+                exact_indexes, match_entries, bounds
+            )
+            if entry_idx is not None:
                 used_entry_indexes.add(entry_idx)
                 display_names[actor_idx] = match_entries[entry_idx]["name"]
 
-        for actor_idx, (points, cells) in enumerate(actor_stats):
+        for actor_idx, actor_stat in enumerate(actor_stats):
             if display_names[actor_idx]:
                 continue
+            points, cells, bounds = self._normalize_actor_match_stat(actor_stat)
             exact_indexes = [
                 entry_idx
                 for entry_idx, entry in enumerate(match_entries)
@@ -1021,8 +1085,10 @@ class MainWindow(QMainWindow):
                 and entry.get("points") == points
                 and entry.get("cells") == cells
             ]
-            if exact_indexes:
-                entry_idx = exact_indexes[0]
+            entry_idx = self._best_gltf_match_entry_index(
+                exact_indexes, match_entries, bounds
+            )
+            if entry_idx is not None:
                 used_entry_indexes.add(entry_idx)
                 display_names[actor_idx] = match_entries[entry_idx]["name"]
 
@@ -1033,6 +1099,48 @@ class MainWindow(QMainWindow):
                 display_names[actor_idx] = ordered_entries[actor_idx]["name"]
 
         return [name or "" for name in display_names]
+
+    def _normalize_actor_match_stat(self, actor_stat):
+        if len(actor_stat) >= 3:
+            return actor_stat[0], actor_stat[1], actor_stat[2]
+        return actor_stat[0], actor_stat[1], None
+
+    def _best_gltf_match_entry_index(self, exact_indexes, match_entries, actor_bounds):
+        if not exact_indexes:
+            return None
+        if len(exact_indexes) == 1:
+            return exact_indexes[0]
+        if actor_bounds is None:
+            return exact_indexes[0]
+
+        scored = []
+        for entry_idx in exact_indexes:
+            entry_bounds = match_entries[entry_idx].get("bounds")
+            if entry_bounds is None:
+                continue
+            scored.append(
+                (self._bounds_center_distance(actor_bounds, entry_bounds), entry_idx)
+            )
+        if not scored:
+            return exact_indexes[0]
+        scored.sort(key=lambda item: item[0])
+        return scored[0][1]
+
+    def _bounds_center_distance(self, bounds_a, bounds_b):
+        center_a = self._bounds_center(bounds_a)
+        center_b = self._bounds_center(bounds_b)
+        if center_a is None or center_b is None:
+            return float("inf")
+        return sum((a - b) ** 2 for a, b in zip(center_a, center_b))
+
+    def _bounds_center(self, bounds):
+        if bounds is None or len(bounds) < 6:
+            return None
+        return (
+            0.5 * (float(bounds[0]) + float(bounds[1])),
+            0.5 * (float(bounds[2]) + float(bounds[3])),
+            0.5 * (float(bounds[4]) + float(bounds[5])),
+        )
 
     def _dedupe_gltf_match_entries(self, entries):
         unique_entries = []
@@ -1106,7 +1214,6 @@ class MainWindow(QMainWindow):
             self.vtk_widget.add_actor(actor, actor_name)
             self._actor_catalog_names[actor_name] = self._best_catalog_name(
                 item_data.get("name"),
-                f"Object_{i}",
             )
             self._actor_display_names[actor_name] = self._original_display_name(
                 item_data.get("name"),
@@ -1120,8 +1227,6 @@ class MainWindow(QMainWindow):
                     sub_name = f"{actor_name}_block_{sub['flat_index']}"
                     self._actor_catalog_names[sub_name] = self._best_catalog_name(
                         sub.get("name"),
-                        f"Object_{sub_idx}",
-                        f"Object_{sub['flat_index']}",
                     )
                     self._actor_display_names[sub_name] = self._original_display_name(
                         sub.get("name"),
@@ -1170,6 +1275,7 @@ class MainWindow(QMainWindow):
         if not actor_name:
             # 点击空白处，清除高亮和选中
             self.vtk_widget.highlight_actor("")
+            self._set_highlight_debug(self.vtk_widget.highlighted_names())
             self._update_geo_info_all(0, 0, self._get_loaded_object_count())
             self.selection_title_label.setText("未选择对象或损伤节点")
             self.selection_meta_label.setText(
@@ -1182,6 +1288,7 @@ class MainWindow(QMainWindow):
 
         # 高亮
         self.vtk_widget.highlight_actor(actor_name)
+        self._set_highlight_debug(self.vtk_widget.highlighted_names())
         info = self.vtk_widget.get_actor_info(actor_name)
         if info:
             self._update_geo_info(info)
@@ -1210,9 +1317,18 @@ class MainWindow(QMainWindow):
                 item.setExpanded(not item.isExpanded())
 
             parent_id = item.data(0, self.DAMAGE_PARENT_ID_ROLE) or "无"
-            matches = self._pdf_catalog_by_damage_leaf_id.get(node_id, [])
-            highlighted_names = self._selection_names_for_catalog_rows(matches)
+            is_hierarchy = item.childCount() > 0
+            if is_hierarchy:
+                damage_ids = self._descendant_leaf_node_ids(item)
+                node_matches = self._node_catalog_rows(node_id)
+                object_matches = self._object_catalog_rows_for_damage_ids(damage_ids)
+                matches = self._damage_display_matches(node_matches, object_matches)
+            else:
+                object_matches = self._object_catalog_rows_for_damage_ids([node_id])
+                matches = self._damage_display_matches([], object_matches)
+            highlighted_names = self._selection_names_for_catalog_rows(object_matches)
             self.vtk_widget.highlight_actors(highlighted_names)
+            self._set_highlight_debug(self.vtk_widget.highlighted_names())
 
             highlight_text = (
                 f"  |  高亮对象: {len(highlighted_names)}" if highlighted_names else ""
@@ -1225,13 +1341,17 @@ class MainWindow(QMainWindow):
                 source_key=node_id,
                 display_name=f"损伤节点: {item.text(0)}",
                 matches=matches,
-                meta=f"节点ID: {node_id}  |  上级ID: {parent_id}  |  下级: {item.childCount()}",
+                meta=(
+                    f"节点ID: {node_id}  |  上级ID: {parent_id}  |  下级: {item.childCount()}"
+                    f"  |  类型: {'层级' if is_hierarchy else '毁伤叶子'}"
+                ),
             )
             return
 
         actor_name = item.data(0, Qt.UserRole)
         if actor_name:
             self.vtk_widget.highlight_actor(actor_name)
+            self._set_highlight_debug(self.vtk_widget.highlighted_names())
             info = self.vtk_widget.get_actor_info(actor_name)
             if info:
                 self._update_geo_info(info)
@@ -1250,6 +1370,56 @@ class MainWindow(QMainWindow):
                 meta="  |  ".join(meta_parts),
             )
 
+    def _descendant_leaf_node_ids(self, item):
+        if item.childCount() == 0:
+            node_id = item.data(0, self.DAMAGE_NODE_ID_ROLE)
+            return [node_id] if node_id else []
+
+        leaf_ids = []
+        for idx in range(item.childCount()):
+            leaf_ids.extend(self._descendant_leaf_node_ids(item.child(idx)))
+        return leaf_ids
+
+    def _node_catalog_rows(self, node_id):
+        return [
+            row
+            for row in self._pdf_catalog_by_model_name.get(node_id, [])
+            if self._is_damage_node_catalog_row(row)
+        ]
+
+    def _object_catalog_rows_for_damage_ids(self, damage_ids):
+        rows = []
+        for damage_id in damage_ids:
+            for row in self._pdf_catalog_by_damage_leaf_id.get(damage_id, []):
+                if self._is_damage_node_catalog_row(row):
+                    continue
+                rows.append(row)
+        return rows
+
+    def _is_damage_node_catalog_row(self, row):
+        model_name = row.get("model_name", "")
+        if model_name not in self._damage_node_ids:
+            return False
+        damage_leaf_id = row.get("damage_leaf_id", "")
+        return not damage_leaf_id or damage_leaf_id == model_name
+
+    def _set_highlight_debug(self, object_names):
+        names = [self._highlight_debug_text(name) for name in object_names if name]
+        text = " ; ".join(names) if names else "无"
+        if len(text) > 160:
+            text = f"{text[:157]}..."
+        self.highlight_debug_label.setText(f"实际高亮: {text}")
+
+    def _highlight_debug_text(self, selection_name):
+        catalog_name = self._catalog_key_for_actor(selection_name)
+        display_name = self._display_name_for_actor(selection_name)
+        blender_name = display_name or catalog_name or selection_name
+        if catalog_name and catalog_name != blender_name:
+            return f"{blender_name} | CSV:{catalog_name} | VTK:{selection_name}"
+        if blender_name != selection_name:
+            return f"{blender_name} | VTK:{selection_name}"
+        return str(selection_name)
+
     def _selection_names_for_catalog_rows(self, rows):
         selection_names = []
         seen = set()
@@ -1262,6 +1432,21 @@ class MainWindow(QMainWindow):
                 selection_names.append(selection_name)
                 seen.add(selection_name)
         return selection_names
+
+    def _damage_display_matches(self, node_matches, object_matches):
+        ordered_matches = []
+        seen = set()
+        for row in (*node_matches, *object_matches):
+            key = (
+                row.get("model_name"),
+                row.get("damage_leaf_id"),
+                row.get("document_path"),
+            )
+            if key in seen:
+                continue
+            ordered_matches.append(row)
+            seen.add(key)
+        return ordered_matches
 
     def _selection_names_for_catalog_key(self, catalog_key):
         if not catalog_key:
@@ -1299,21 +1484,6 @@ class MainWindow(QMainWindow):
         mapped_name = self._actor_catalog_names.get(actor_name)
         if mapped_name and mapped_name in self._pdf_catalog_by_model_name:
             return mapped_name
-
-        if actor_name.startswith("Object_"):
-            return actor_name
-
-        block_match = re.search(r"_block_(\d+)$", actor_name)
-        if block_match:
-            fallback_name = f"Object_{block_match.group(1)}"
-            if fallback_name in self._pdf_catalog_by_model_name:
-                return fallback_name
-
-        actor_match = re.fullmatch(r"actor_(\d+)", actor_name)
-        if actor_match:
-            fallback_name = f"Object_{actor_match.group(1)}"
-            if fallback_name in self._pdf_catalog_by_model_name:
-                return fallback_name
 
         return mapped_name or actor_name
 
@@ -1446,6 +1616,7 @@ class MainWindow(QMainWindow):
         self._current_file = None
         self.catalog_table.setRowCount(0)
         self._current_catalog_matches = []
+        self._set_highlight_debug(self.vtk_widget.highlighted_names())
         self.selection_title_label.setText("未选择对象或损伤节点")
         self.selection_meta_label.setText(
             "请选择模型中的 object，或点击左侧损伤树节点。"
