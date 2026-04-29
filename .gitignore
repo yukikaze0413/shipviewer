@@ -18,8 +18,17 @@ Thumbs.db
 *.gltf
 *.bin
 
+# Optional external water texture assets
+assets/water/*
+!assets/water/README.txt
+
 # bat files
 *.bat
 *.ps1
+!build_exe.ps1
+
+# PyInstaller outputs
+build/
+dist/
 
 

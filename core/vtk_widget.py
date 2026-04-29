@@ -4,6 +4,7 @@ VTK渲染窗口组件
 """
 
 import math
+import os
 
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import (
@@ -146,6 +147,10 @@ class VTKWidget(QWidget):
     DYNAMIC_HIDE_MAX_CELLS = 40_000
     CAMERA_VIEW_ANGLE_DEG = 28.0
     CAMERA_FRAME_PADDING = 1.08
+    FOCUS_FRAME_PADDING = 1.28
+    FOCUS_DIM_OPACITY = 0.22
+    WATER_DEFAULT_SIZE = 180.0
+    WATER_TILE_SIZE = 24.0
 
     # 信号
     model_clicked = Signal(str)
@@ -169,8 +174,16 @@ class VTKWidget(QWidget):
         self._background_image_reader = None
         self._background_texture = None
         self._skybox_actor = None
+        self._water_actor = None
+        self._water_polydata = None
+        self._water_points = None
+        self._water_tcoords = None
+        self._water_texture = None
+        self._water_texture_reader = None
         self._dynamic_hidden_actor_names = set()
         self._dynamic_hide_active = False
+        self._focus_dimmed_actor_state = {}
+        self._focus_selected_base_names = set()
         self._camera_debug_annotation = None
         self._camera_debug_overlay_visible = False
         self._setup_ui()
@@ -217,7 +230,7 @@ class VTKWidget(QWidget):
         self.render_window.AddObserver("StartEvent", self._on_render_start, 1.0)
 
         self._add_axes_widget()
-        self._add_grid_floor()
+        self._add_water_surface()
         self._setup_lighting()
         self._setup_camera_debug_overlay()
 
@@ -436,6 +449,126 @@ class VTKWidget(QWidget):
         self.grid_actor.GetProperty().SetColor(0.25, 0.27, 0.3)
         self.grid_actor.GetProperty().SetOpacity(0.2)
         self.renderer.AddActor(self.grid_actor)
+
+    def _add_water_surface(self):
+        self._water_points = vtk.vtkPoints()
+        self._water_tcoords = vtk.vtkFloatArray()
+        self._water_tcoords.SetNumberOfComponents(2)
+        self._water_tcoords.SetName("TextureCoordinates")
+
+        quad = vtk.vtkQuad()
+        for idx in range(4):
+            quad.GetPointIds().SetId(idx, idx)
+
+        polys = vtk.vtkCellArray()
+        polys.InsertNextCell(quad)
+
+        self._water_polydata = vtk.vtkPolyData()
+        self._water_polydata.SetPoints(self._water_points)
+        self._water_polydata.SetPolys(polys)
+        self._water_polydata.GetPointData().SetTCoords(self._water_tcoords)
+        self._update_water_surface_geometry()
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(self._water_polydata)
+
+        self._water_actor = vtk.vtkActor()
+        self._water_actor.SetMapper(mapper)
+        self._water_actor.PickableOff()
+        prop = self._water_actor.GetProperty()
+        prop.SetColor(0.34, 0.62, 0.82)
+        prop.SetOpacity(0.58)
+        prop.SetSpecular(0.45)
+        prop.SetSpecularPower(32.0)
+        prop.LightingOn()
+        self.renderer.AddActor(self._water_actor)
+
+    def _update_water_surface_geometry(self, bounds=None):
+        if self._water_points is None or self._water_tcoords is None:
+            return
+
+        if bounds is None:
+            center_x = 0.0
+            center_z = 0.0
+            water_y = 0.0
+            size = self.WATER_DEFAULT_SIZE
+        else:
+            center_x = 0.5 * (bounds[0] + bounds[1])
+            center_z = 0.5 * (bounds[4] + bounds[5])
+            span_x = bounds[1] - bounds[0]
+            span_z = bounds[5] - bounds[4]
+            horizontal_span = max(span_x, span_z, self.WATER_DEFAULT_SIZE)
+            water_y = bounds[2] - max(horizontal_span * 0.015, 0.1)
+            size = horizontal_span * 2.6
+
+        half = size * 0.5
+        points = (
+            (center_x - half, water_y, center_z - half),
+            (center_x + half, water_y, center_z - half),
+            (center_x + half, water_y, center_z + half),
+            (center_x - half, water_y, center_z + half),
+        )
+        repeat = max(size / self.WATER_TILE_SIZE, 1.0)
+        tcoords = ((0.0, 0.0), (repeat, 0.0), (repeat, repeat), (0.0, repeat))
+
+        self._water_points.SetNumberOfPoints(4)
+        self._water_tcoords.SetNumberOfTuples(4)
+        for idx, point in enumerate(points):
+            self._water_points.SetPoint(idx, *point)
+            self._water_tcoords.SetTuple2(idx, *tcoords[idx])
+
+        if self._water_polydata is not None:
+            self._water_points.Modified()
+            self._water_tcoords.Modified()
+            self._water_polydata.Modified()
+
+    def set_water_surface(self, texture_path="", visible=True):
+        if self._water_actor is None:
+            return False
+
+        texture_loaded = self._set_water_texture(texture_path)
+        self.set_water_surface_visible(visible, render=False)
+        self.update_water_surface_to_scene(render=False)
+        self.render_window.Render()
+        return texture_loaded
+
+    def set_water_surface_visible(self, visible=True, render=True):
+        if self._water_actor is None:
+            return
+        self._water_actor.SetVisibility(bool(visible))
+        if render:
+            self.render_window.Render()
+
+    def update_water_surface_to_scene(self, render=True):
+        self._update_water_surface_geometry(self._get_scene_model_bounds())
+        if render:
+            self.render_window.Render()
+
+    def _set_water_texture(self, texture_path):
+        if not texture_path or not os.path.exists(texture_path):
+            self._water_texture = None
+            self._water_texture_reader = None
+            self._water_actor.SetTexture(None)
+            return False
+
+        reader_factory = vtk.vtkImageReader2Factory()
+        reader = reader_factory.CreateImageReader2(texture_path)
+        if reader is None:
+            self._water_actor.SetTexture(None)
+            return False
+
+        reader.SetFileName(texture_path)
+        reader.Update()
+
+        texture = vtk.vtkTexture()
+        texture.SetInputConnection(reader.GetOutputPort())
+        texture.InterpolateOn()
+        texture.RepeatOn()
+
+        self._water_texture_reader = reader
+        self._water_texture = texture
+        self._water_actor.SetTexture(texture)
+        return True
 
     def _current_interactor_event_position(self):
         return self.interactor.GetEventPosition()
@@ -676,6 +809,11 @@ class VTKWidget(QWidget):
 
     def remove_actor(self, name):
         if name in self._actors:
+            if (
+                name in self._focus_selected_base_names
+                or name in self._focus_dimmed_actor_state
+            ):
+                self.clear_selection_focus()
             selected_names = [
                 selected_name
                 for selected_name in self._selected_actor_names
@@ -703,6 +841,7 @@ class VTKWidget(QWidget):
             self._remove_selection_entries_for_base(name)
 
     def clear_scene(self):
+        self.clear_selection_focus()
         for selected_name in self._selected_actor_names:
             self._clear_highlight(selected_name)
         self._remove_all_highlight_overlays()
@@ -719,9 +858,12 @@ class VTKWidget(QWidget):
         self._base_to_dataset_alias.clear()
         self._dynamic_hidden_actor_names.clear()
         self._dynamic_hide_active = False
+        self._focus_dimmed_actor_state.clear()
+        self._focus_selected_base_names.clear()
         self._selected_actor_name = None
         self._selected_actor_names = []
         self._highlight_overlay_actors.clear()
+        self.update_water_surface_to_scene(render=False)
 
     def highlight_actor(self, name):
         self.highlight_actors([name] if name else [])
@@ -747,6 +889,69 @@ class VTKWidget(QWidget):
     def highlighted_names(self):
         return list(self._selected_actor_names)
 
+    def focus_selection(self, names):
+        unique_names = self._valid_selection_names(names)
+        if not unique_names:
+            self.clear_selection_focus(render=True)
+            return False
+
+        selected_bases = self._base_names_for_selection(unique_names)
+        bounds = self._bounds_for_selection(unique_names)
+        if bounds is None:
+            self.clear_selection_focus(render=True)
+            return False
+
+        self._apply_selection_focus_dim(selected_bases)
+        self._frame_bounds_from_best_view(bounds, padding=self.FOCUS_FRAME_PADDING)
+        self.render_window.Render()
+        return True
+
+    def clear_selection_focus(self, render=False):
+        if not self._focus_dimmed_actor_state and not self._focus_selected_base_names:
+            return
+        self._restore_focus_dimmed_actors()
+        self._focus_selected_base_names.clear()
+        if render:
+            self.render_window.Render()
+
+    def _valid_selection_names(self, names):
+        unique_names = []
+        seen = set()
+        for name in names:
+            if not name or name in seen or name not in self._selection_targets:
+                continue
+            unique_names.append(name)
+            seen.add(name)
+        return unique_names
+
+    def _base_names_for_selection(self, names):
+        return {
+            target[0]
+            for name in names
+            for target in [self._selection_targets.get(name)]
+            if target and target[0] in self._actors
+        }
+
+    def _apply_selection_focus_dim(self, selected_bases):
+        self._restore_focus_dimmed_actors()
+        self._focus_selected_base_names = set(selected_bases)
+        if not selected_bases:
+            return
+
+        for base_name, actor in self._actors.items():
+            if base_name in selected_bases:
+                continue
+            prop = actor.GetProperty()
+            self._focus_dimmed_actor_state[base_name] = prop.GetOpacity()
+            prop.SetOpacity(self.FOCUS_DIM_OPACITY)
+
+    def _restore_focus_dimmed_actors(self):
+        for base_name, opacity in list(self._focus_dimmed_actor_state.items()):
+            actor = self._actors.get(base_name)
+            if actor is not None:
+                actor.GetProperty().SetOpacity(opacity)
+        self._focus_dimmed_actor_state.clear()
+
     def _camera_pose_iso(self):
         return (1.0, 1.0, 1.0), (0.0, 1.0, 0.0)
 
@@ -766,6 +971,7 @@ class VTKWidget(QWidget):
         self.render_window.Render()
 
     def reset_camera(self):
+        self.clear_selection_focus()
         self._apply_camera_pose(*self._camera_pose_iso())
 
     def set_view_front(self):
@@ -785,14 +991,17 @@ class VTKWidget(QWidget):
         if bounds is None:
             self.renderer.ResetCamera()
             return
+        self._reset_camera_to_bounds(bounds, direction, view_up)
 
+    def _reset_camera_to_bounds(
+        self, bounds, direction, view_up, padding=None, clipping_bounds=None
+    ):
+        if padding is None:
+            padding = self.CAMERA_FRAME_PADDING
         center, radius = self._bounds_center_radius(bounds)
         direction = self._normalize_vector(direction)
         view_angle_rad = math.radians(self.CAMERA_VIEW_ANGLE_DEG)
-        distance = max(
-            radius * self.CAMERA_FRAME_PADDING / math.sin(view_angle_rad / 2.0),
-            1.0,
-        )
+        distance = max(radius * padding / math.sin(view_angle_rad / 2.0), 1.0)
 
         camera = self.renderer.GetActiveCamera()
         camera.SetViewAngle(self.CAMERA_VIEW_ANGLE_DEG)
@@ -807,9 +1016,68 @@ class VTKWidget(QWidget):
         # 原因是当前俯视调参阶段需要保留传入的原始 view_up 语义，便于通过调试框观察输入效果；
         # 若启用正交化，VTK 会把 view_up 投影到与视线垂直的平面上，导致观测值被几何修正。
         camera.SetRoll(0.0)
-        self.renderer.ResetCameraClippingRange(bounds)
+        self.renderer.ResetCameraClippingRange(clipping_bounds or bounds)
         if camera.GetParallelProjection():
-            camera.SetParallelScale(radius * self.CAMERA_FRAME_PADDING)
+            camera.SetParallelScale(radius * padding)
+
+    def _frame_bounds_from_current_view(self, bounds, padding=None):
+        camera = self.renderer.GetActiveCamera()
+        if camera is None:
+            self._reset_camera_to_bounds(
+                bounds,
+                *self._camera_pose_iso(),
+                padding=padding,
+                clipping_bounds=self._get_scene_model_bounds() or bounds,
+            )
+            return
+
+        direction = self._normalize_vector(
+            (
+                camera.GetPosition()[0] - camera.GetFocalPoint()[0],
+                camera.GetPosition()[1] - camera.GetFocalPoint()[1],
+                camera.GetPosition()[2] - camera.GetFocalPoint()[2],
+            )
+        )
+        view_up = self._normalize_vector(camera.GetViewUp())
+        self._reset_camera_to_bounds(
+            bounds,
+            direction,
+            view_up,
+            padding=padding,
+            clipping_bounds=self._get_scene_model_bounds() or bounds,
+        )
+
+    def _frame_bounds_from_best_view(self, bounds, padding=None):
+        scene_bounds = self._get_scene_model_bounds()
+        direction, view_up = self._best_focus_camera_pose(bounds, scene_bounds)
+        self._reset_camera_to_bounds(
+            bounds,
+            direction,
+            view_up,
+            padding=padding,
+            clipping_bounds=scene_bounds or bounds,
+        )
+
+    def _best_focus_camera_pose(self, focus_bounds, scene_bounds):
+        focus_center, _ = self._bounds_center_radius(focus_bounds)
+        if scene_bounds is None:
+            return self._camera_pose_iso()
+
+        scene_center, _ = self._bounds_center_radius(scene_bounds)
+        offset_x = focus_center[0] - scene_center[0]
+        offset_z = focus_center[2] - scene_center[2]
+        horizontal_length = math.sqrt(offset_x * offset_x + offset_z * offset_z)
+        scene_width = max(
+            scene_bounds[1] - scene_bounds[0],
+            scene_bounds[5] - scene_bounds[4],
+        )
+
+        if horizontal_length <= max(scene_width * 0.06, 1e-6):
+            return self._camera_pose_iso()
+
+        outward_x = offset_x / horizontal_length
+        outward_z = offset_z / horizontal_length
+        return self._normalize_vector((outward_x, 0.42, outward_z)), (0.0, 1.0, 0.0)
 
     def _get_scene_model_bounds(self):
         visible_bounds = []
@@ -835,6 +1103,77 @@ class VTKWidget(QWidget):
             max(bounds[3] for bounds in visible_bounds),
             min(bounds[4] for bounds in visible_bounds),
             max(bounds[5] for bounds in visible_bounds),
+        )
+
+    def _bounds_for_selection(self, names):
+        selection_bounds = []
+        for name in names:
+            target = self._selection_targets.get(name)
+            if not target:
+                continue
+            base_name, flat_index = target
+            actor = self._actors.get(base_name)
+            if actor is None:
+                continue
+
+            bounds = self._bounds_for_selection_target(actor, flat_index)
+            if self._valid_bounds(bounds):
+                selection_bounds.append(bounds)
+
+        return self._union_bounds(selection_bounds)
+
+    def _bounds_for_selection_target(self, actor, flat_index):
+        data_obj = self._highlight_data_object(actor, flat_index)
+        if data_obj is not None:
+            try:
+                local_bounds = data_obj.GetBounds()
+            except TypeError:
+                local_bounds = None
+            transformed_bounds = self._transform_bounds(local_bounds, actor.GetMatrix())
+            if self._valid_bounds(transformed_bounds):
+                return transformed_bounds
+
+        return actor.GetBounds()
+
+    def _valid_bounds(self, bounds):
+        return (
+            bounds
+            and len(bounds) == 6
+            and bounds[0] <= bounds[1]
+            and bounds[2] <= bounds[3]
+            and bounds[4] <= bounds[5]
+        )
+
+    def _union_bounds(self, bounds_list):
+        bounds_list = [bounds for bounds in bounds_list if self._valid_bounds(bounds)]
+        if not bounds_list:
+            return None
+        return (
+            min(bounds[0] for bounds in bounds_list),
+            max(bounds[1] for bounds in bounds_list),
+            min(bounds[2] for bounds in bounds_list),
+            max(bounds[3] for bounds in bounds_list),
+            min(bounds[4] for bounds in bounds_list),
+            max(bounds[5] for bounds in bounds_list),
+        )
+
+    def _transform_bounds(self, bounds, matrix):
+        if not self._valid_bounds(bounds) or matrix is None:
+            return bounds
+
+        points = []
+        for x in (bounds[0], bounds[1]):
+            for y in (bounds[2], bounds[3]):
+                for z in (bounds[4], bounds[5]):
+                    points.append(matrix.MultiplyPoint((x, y, z, 1.0)))
+
+        return (
+            min(point[0] for point in points),
+            max(point[0] for point in points),
+            min(point[1] for point in points),
+            max(point[1] for point in points),
+            min(point[2] for point in points),
+            max(point[2] for point in points),
         )
 
     def _bounds_center_radius(self, bounds):
@@ -865,7 +1204,6 @@ class VTKWidget(QWidget):
         self.render_window.Render()
 
     def toggle_grid(self, visible=True):
-        self.grid_actor.SetVisibility(visible)
         self.render_window.Render()
 
     def refresh(self):
@@ -965,7 +1303,7 @@ class VTKWidget(QWidget):
         if data_obj is None:
             return None
 
-        mapper = self._highlight_mapper_for_data(data_obj)
+        mapper = self._highlight_outline_mapper_for_data(data_obj)
         if mapper is None:
             return None
 
@@ -978,10 +1316,9 @@ class VTKWidget(QWidget):
         overlay_actor.SetUserMatrix(matrix)
 
         prop = overlay_actor.GetProperty()
-        prop.SetColor(1.0, 0.62, 0.0)
+        prop.SetColor(1.0, 0.45, 0.45)
         prop.SetOpacity(1.0)
-        prop.SetRepresentationToWireframe()
-        prop.SetLineWidth(3.0)
+        prop.SetLineWidth(2.0)
         prop.LightingOff()
         if hasattr(prop, "SetRenderLinesAsTubes"):
             prop.SetRenderLinesAsTubes(True)
@@ -1007,22 +1344,36 @@ class VTKWidget(QWidget):
             iterator.GoToNextItem()
         return None
 
-    def _highlight_mapper_for_data(self, data_obj):
+    def _highlight_outline_mapper_for_data(self, data_obj):
         if data_obj is None:
             return None
+
+        silhouette = vtk.vtkPolyDataSilhouette()
+        silhouette.SetCamera(self.renderer.GetActiveCamera())
+        silhouette.SetEnableFeatureAngle(False)
+        silhouette.BorderEdgesOn()
+
         if data_obj.IsA("vtkPolyData"):
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputData(data_obj)
+            silhouette.SetInputData(data_obj)
+            pipeline_refs = (silhouette,)
         elif data_obj.IsA("vtkCompositeDataSet"):
-            mapper = vtk.vtkCompositePolyDataMapper()
-            mapper.SetInputDataObject(data_obj)
+            geometry_filter = vtk.vtkCompositeDataGeometryFilter()
+            geometry_filter.SetInputDataObject(data_obj)
+            silhouette.SetInputConnection(geometry_filter.GetOutputPort())
+            pipeline_refs = (geometry_filter, silhouette)
         elif data_obj.IsA("vtkDataSet"):
-            mapper = vtk.vtkDataSetMapper()
-            mapper.SetInputData(data_obj)
+            geometry_filter = vtk.vtkGeometryFilter()
+            geometry_filter.SetInputData(data_obj)
+            silhouette.SetInputConnection(geometry_filter.GetOutputPort())
+            pipeline_refs = (geometry_filter, silhouette)
         else:
             return None
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(silhouette.GetOutputPort())
+        mapper._highlight_pipeline_refs = pipeline_refs
         if hasattr(mapper, "SetStatic"):
-            mapper.SetStatic(True)
+            mapper.SetStatic(False)
         return mapper
 
     def _compute_actor_bounding_sphere(self, actor):

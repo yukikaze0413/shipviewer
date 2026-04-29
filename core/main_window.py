@@ -4,6 +4,7 @@
 """
 
 import csv
+import glob
 import json
 import os
 import re
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QVBoxLayout,
     QHBoxLayout,
+    QFormLayout,
     QWidget,
     QMenu,
     QMenuBar,
@@ -33,9 +35,11 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QPushButton,
     QAbstractItemView,
+    QScrollArea,
+    QFrame,
 )
 from PySide6.QtCore import Qt, QSize, QTimer, QUrl
-from PySide6.QtGui import QAction, QKeySequence, QDesktopServices
+from PySide6.QtGui import QAction, QKeySequence, QDesktopServices, QPixmap, QFont
 
 try:
     from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -53,12 +57,14 @@ except ImportError:
 
 from core.vtk_widget import VTKWidget
 from core.model_loader import ModelLoadThread, get_supported_formats
+from core.paths import app_base_dir, app_path
 
 
 class MainWindow(QMainWindow):
     DAMAGE_NODE_ID_ROLE = Qt.UserRole + 100
     DAMAGE_PARENT_ID_ROLE = Qt.UserRole + 101
     DAMAGE_LEVEL_ROLE = Qt.UserRole + 102
+    GLTF_THREADED_LOAD_THRESHOLD_BYTES = 64 * 1024 * 1024
 
     """主窗口"""
 
@@ -73,22 +79,34 @@ class MainWindow(QMainWindow):
         self._gltf_importer = None
         self._loaded_items = []
         self._is_wireframe = False
-        self._project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self._damage_tree_csv_path = os.path.join(
-            self._project_root, "damage-tree-nodes.csv"
+        self._project_root = app_base_dir()
+        self._assets_root = app_path("assets")
+        self._damage_tree_csv_path = self._resolve_data_file(
+            ("assets", "csv", "damage-tree-nodes.csv"),
+            "damage-tree-nodes.csv",
         )
-        self._pdf_catalog_csv_path = os.path.join(
-            self._project_root, "part-pdf-catalog.csv"
+        self._pdf_catalog_csv_path = self._resolve_data_file(
+            ("assets", "csv", "part-pdf-catalog.csv"),
+            "part-pdf-catalog.csv",
         )
-        self._viewport_background_path = os.path.join(
-            self._project_root,
-            "assets",
-            "backgrounds",
-            "citrus_orchard_puresky_4k.hdr",
+        self._device_catalog_json_path = self._resolve_data_file(
+            ("assets", "json", "device-catalog.json"),
+            "device-catalog.json",
+        )
+        self._viewport_background_path = self._resolve_background_hdr_path()
+        self._water_texture_path = self._resolve_data_file(
+            ("assets", "water", "water_diffuse.jpg"),
+            ("assets", "water", "water_diffuse.png"),
+            ("assets", "water", "material.png"),
+            ("assets", "water", "water.jpg"),
+            ("assets", "water", "water.png"),
         )
         self._pdf_catalog_rows = []
         self._pdf_catalog_by_model_name = defaultdict(list)
         self._pdf_catalog_by_damage_leaf_id = defaultdict(list)
+        self._device_catalog_rows = []
+        self._device_catalog_by_model_name = defaultdict(list)
+        self._device_catalog_by_damage_leaf_id = defaultdict(list)
         self._damage_nodes_by_id = {}
         self._damage_children_by_id = defaultdict(list)
         self._damage_node_ids = set()
@@ -105,6 +123,7 @@ class MainWindow(QMainWindow):
         self._create_properties_dock()
         self._create_status_bar()
         self._load_pdf_catalog_from_csv()
+        self._load_device_catalog_from_json()
         self._load_damage_tree_from_csv()
 
         # 信号连接
@@ -116,6 +135,41 @@ class MainWindow(QMainWindow):
     # ============================================================
     # UI 构建
     # ============================================================
+
+    def _resolve_data_file(self, *relative_candidates):
+        for candidate in relative_candidates:
+            if isinstance(candidate, (tuple, list)):
+                path = os.path.join(self._project_root, *candidate)
+            else:
+                path = os.path.join(self._project_root, candidate)
+            path = os.path.normpath(path)
+            if os.path.exists(path):
+                return path
+
+        first = relative_candidates[0]
+        if isinstance(first, (tuple, list)):
+            return os.path.normpath(os.path.join(self._project_root, *first))
+        return os.path.normpath(os.path.join(self._project_root, first))
+
+    def _resolve_background_hdr_path(self):
+        backgrounds_dir = os.path.join(self._assets_root, "backgrounds")
+        preferred_names = (
+            "background.hdr",
+            "environment.hdr",
+            "water.hdr",
+            "citrus_orchard_puresky_4k.hdr",
+        )
+
+        for filename in preferred_names:
+            path = os.path.join(backgrounds_dir, filename)
+            if os.path.exists(path):
+                return os.path.normpath(path)
+
+        hdr_paths = sorted(glob.glob(os.path.join(backgrounds_dir, "*.hdr")))
+        if hdr_paths:
+            return os.path.normpath(hdr_paths[0])
+
+        return os.path.normpath(os.path.join(backgrounds_dir, preferred_names[0]))
 
     def _create_vtk_viewport(self):
         """创建VTK 3D视口"""
@@ -198,12 +252,11 @@ class MainWindow(QMainWindow):
         self.action_wireframe.toggled.connect(self._toggle_wireframe)
         view_menu.addAction(self.action_wireframe)
 
-        self.action_grid = QAction("显示网格(&G)", self)
-        self.action_grid.setShortcut(QKeySequence("G"))
-        self.action_grid.setCheckable(True)
-        self.action_grid.setChecked(True)
-        self.action_grid.toggled.connect(self.vtk_widget.toggle_grid)
-        view_menu.addAction(self.action_grid)
+        self.action_water = QAction("显示水面", self)
+        self.action_water.setCheckable(True)
+        self.action_water.setChecked(True)
+        self.action_water.toggled.connect(self.vtk_widget.set_water_surface_visible)
+        view_menu.addAction(self.action_water)
 
         self.action_camera_debug = QAction("显示相机调试框", self)
         self.action_camera_debug.setCheckable(True)
@@ -346,18 +399,19 @@ class MainWindow(QMainWindow):
     def _create_properties_dock(self):
         """创建信息展示停靠窗口"""
         self.props_dock = QDockWidget("信息展示", self)
-        self.props_dock.setMinimumWidth(420)
+        self.props_dock.setMinimumWidth(220)
         self.props_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable
         )
 
         props_container = QWidget()
+        props_container.setMinimumWidth(0)
         props_layout = QVBoxLayout(props_container)
         props_layout.setContentsMargins(0, 0, 0, 0)
         props_layout.setSpacing(0)
 
         # These widgets keep the selection state for existing update logic, but are not
-        # shown because the right dock is dedicated to the document preview.
+        # shown because the right dock is dedicated to the device detail view.
         self.selection_title_label = QLabel("未选择对象或损伤节点")
         self.selection_title_label.setObjectName("accentLabel")
         self.selection_title_label.setWordWrap(True)
@@ -368,7 +422,7 @@ class MainWindow(QMainWindow):
 
         self.catalog_table = QTableWidget()
         self.catalog_table.setColumnCount(3)
-        self.catalog_table.setHorizontalHeaderLabels(["名称", "匹配ID", "文档"])
+        self.catalog_table.setHorizontalHeaderLabels(["名称", "匹配ID", "详情"])
         self.catalog_table.horizontalHeader().setStretchLastSection(True)
         self.catalog_table.verticalHeader().setVisible(False)
         self.catalog_table.setAlternatingRowColors(True)
@@ -378,35 +432,24 @@ class MainWindow(QMainWindow):
         self.catalog_table.setMaximumHeight(140)
         self.catalog_table.cellClicked.connect(self._on_catalog_row_clicked)
 
-        self.document_status_label = QLabel("未选择文档")
+        self.document_status_label = QLabel("未选择设备")
         self.document_status_label.setWordWrap(True)
         self.open_document_button = QPushButton("打开文档")
         self.open_document_button.setEnabled(False)
         self.open_document_button.clicked.connect(self._open_current_document)
 
         self.document_view = QStackedWidget()
-        self.document_message_view = QLabel("未选择文档")
+        self.document_view.setMinimumWidth(0)
+        self.document_message_view = QLabel("未选择设备")
+        self.document_message_view.setMinimumWidth(0)
         self.document_message_view.setAlignment(Qt.AlignCenter)
         self.document_message_view.setWordWrap(True)
         self.document_view.addWidget(self.document_message_view)
 
-        if QPdfDocument is not None and QPdfView is not None:
-            self.pdf_document = QPdfDocument(self)
-            self.pdf_view = QPdfView()
-            self.pdf_view.setDocument(self.pdf_document)
-            self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
-            self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
-            self.document_view.addWidget(self.pdf_view)
-        else:
-            self.pdf_document = None
-            self.pdf_view = None
-
-        if QWebEngineView is not None:
-            self.web_document_view = QWebEngineView()
-            self._configure_document_view(self.web_document_view)
-            self.document_view.addWidget(self.web_document_view)
-        else:
-            self.web_document_view = None
+        self.pdf_document = None
+        self.pdf_view = None
+        self.web_document_view = None
+        self._create_device_detail_view()
 
         self.document_view.setMinimumHeight(260)
         props_layout.addWidget(self.document_view, 1)
@@ -442,10 +485,65 @@ class MainWindow(QMainWindow):
         self.vtk_widget.initialize()
         if os.path.exists(self._viewport_background_path):
             self.vtk_widget.set_background_image(self._viewport_background_path)
+        self.vtk_widget.set_water_surface(
+            self._water_texture_path
+            if os.path.exists(self._water_texture_path)
+            else ""
+        )
 
     def _reload_damage_tree(self):
         self._load_pdf_catalog_from_csv()
+        self._load_device_catalog_from_json()
         self._load_damage_tree_from_csv()
+
+    def _create_device_detail_view(self):
+        detail_scroll = QScrollArea()
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QFrame.NoFrame)
+        detail_scroll.setMinimumWidth(0)
+
+        detail_widget = QWidget()
+        detail_layout = QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(18, 18, 18, 18)
+        detail_layout.setSpacing(14)
+
+        self.device_title_label = QLabel("未选择设备")
+        self.device_title_label.setObjectName("accentLabel")
+        self.device_title_label.setWordWrap(True)
+        detail_layout.addWidget(self.device_title_label)
+
+        self.device_image_label = QLabel("未配置设备图片")
+        self.device_image_label.setAlignment(Qt.AlignCenter)
+        self.device_image_label.setMinimumHeight(180)
+        self.device_image_label.setFrameShape(QFrame.StyledPanel)
+        self.device_image_label.setWordWrap(True)
+        detail_layout.addWidget(self.device_image_label)
+
+        detail_form = QFormLayout()
+        detail_form.setLabelAlignment(Qt.AlignRight | Qt.AlignTop)
+        detail_form.setFormAlignment(Qt.AlignTop)
+        detail_form.setHorizontalSpacing(12)
+        detail_form.setVerticalSpacing(10)
+
+        self.device_field_labels = {}
+        for field_key, field_name in (
+            ("material", "材质"),
+            ("thickness", "厚度"),
+            ("size", "尺寸"),
+            ("function", "功能"),
+        ):
+            value_label = QLabel("待补充")
+            value_label.setWordWrap(True)
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.device_field_labels[field_key] = value_label
+            detail_form.addRow(f"{field_name}:", value_label)
+
+        detail_layout.addLayout(detail_form)
+        detail_layout.addStretch(1)
+
+        detail_scroll.setWidget(detail_widget)
+        self.device_detail_view = detail_scroll
+        self.document_view.addWidget(self.device_detail_view)
 
     def _configure_document_view(self, document_view):
         if QWebEngineSettings is None:
@@ -535,6 +633,66 @@ class MainWindow(QMainWindow):
             raise last_error
         return []
 
+    def _load_device_catalog_from_json(self, json_path=None):
+        json_path = json_path or self._device_catalog_json_path
+        self._device_catalog_rows = []
+        self._device_catalog_by_model_name.clear()
+        self._device_catalog_by_damage_leaf_id.clear()
+
+        if not os.path.exists(json_path):
+            return
+
+        try:
+            rows = self._read_device_catalog_rows(json_path)
+        except Exception as exc:
+            self._set_document_message(f"读取设备详情失败: {exc}")
+            return
+
+        self._device_catalog_rows = rows
+        for row in rows:
+            model_name = row["model_name"]
+            damage_leaf_id = row["damage_leaf_id"]
+            if model_name:
+                self._device_catalog_by_model_name[model_name].append(row)
+            if damage_leaf_id:
+                self._device_catalog_by_damage_leaf_id[damage_leaf_id].append(row)
+
+    def _read_device_catalog_rows(self, json_path):
+        with open(json_path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            devices = data.get("devices", [])
+        else:
+            devices = data
+        if not isinstance(devices, list):
+            raise ValueError("设备详情 JSON 必须是数组，或包含 devices 数组。")
+
+        rows = []
+        for idx, item in enumerate(devices, start=1):
+            if not isinstance(item, dict):
+                continue
+            model_name = str(item.get("model_name", "")).strip()
+            display_name = str(item.get("display_name", "")).strip()
+            damage_leaf_id = str(item.get("damage_leaf_id", "")).strip()
+            if not any((model_name, display_name, damage_leaf_id)):
+                continue
+
+            rows.append(
+                {
+                    "model_name": model_name,
+                    "display_name": display_name or model_name or damage_leaf_id,
+                    "damage_leaf_id": damage_leaf_id,
+                    "image_path": str(item.get("image_path", "")).strip(),
+                    "material": str(item.get("material", "")).strip(),
+                    "thickness": str(item.get("thickness", "")).strip(),
+                    "size": str(item.get("size", "")).strip(),
+                    "function": str(item.get("function", "")).strip(),
+                    "row_number": idx,
+                }
+            )
+        return rows
+
     def _resolve_document_path(self, document_path):
         raw_path = (document_path or "").strip().strip('"')
         if not raw_path:
@@ -549,24 +707,49 @@ class MainWindow(QMainWindow):
         if os.path.isabs(raw_path):
             return os.path.normpath(raw_path)
 
+        candidates = []
         if not os.path.dirname(raw_path):
-            pdfs_path = os.path.normpath(
-                os.path.join(self._project_root, "pdfs", raw_path)
-            )
-            if os.path.exists(pdfs_path):
-                return pdfs_path
+            candidates.append(os.path.join(self._assets_root, "pdfs", raw_path))
 
-        project_path = os.path.normpath(os.path.join(self._project_root, raw_path))
-        if os.path.exists(project_path):
-            return project_path
-
-        pdfs_path = os.path.normpath(
+        candidates.append(os.path.join(self._project_root, raw_path))
+        candidates.append(
+            os.path.join(self._assets_root, "pdfs", os.path.basename(raw_path))
+        )
+        candidates.append(
             os.path.join(self._project_root, "pdfs", os.path.basename(raw_path))
         )
-        if os.path.exists(pdfs_path):
-            return pdfs_path
 
-        return project_path
+        for candidate in candidates:
+            candidate = os.path.normpath(candidate)
+            if os.path.exists(candidate):
+                return candidate
+
+        return os.path.normpath(candidates[0] if candidates else raw_path)
+
+    def _resolve_device_image_path(self, image_path):
+        raw_path = (image_path or "").strip().strip('"')
+        if not raw_path:
+            return ""
+
+        if re.match(r"^[A-Za-z]:[\\/]", raw_path):
+            return os.path.normpath(raw_path)
+
+        if raw_path.startswith(("/", "\\")):
+            raw_path = raw_path.lstrip("/\\")
+
+        if os.path.isabs(raw_path):
+            return os.path.normpath(raw_path)
+
+        candidates = [
+            os.path.join(self._assets_root, raw_path),
+            os.path.join(self._project_root, raw_path),
+            os.path.join(self._assets_root, "images", "devices", os.path.basename(raw_path)),
+        ]
+        for candidate in candidates:
+            candidate = os.path.normpath(candidate)
+            if os.path.exists(candidate):
+                return candidate
+        return os.path.normpath(candidates[0])
 
     def _load_damage_tree_from_csv(self, csv_path=None):
         csv_path = csv_path or self._damage_tree_csv_path
@@ -691,6 +874,10 @@ class MainWindow(QMainWindow):
         item.setData(0, self.DAMAGE_LEVEL_ROLE, level)
         if has_children:
             item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+            font = QFont()
+            font.setBold(True)
+            font.setPointSize(11 if level == 0 else 10)
+            item.setFont(0, font)
 
         parent_name = nodes_by_id[parent_id]["name"] if has_parent else "无"
         path_text = " / ".join((*lineage, name))
@@ -750,15 +937,57 @@ class MainWindow(QMainWindow):
 
         ext = os.path.splitext(filepath)[1].lower()
         if ext in (".glb", ".gltf"):
+            if self._should_load_gltf_in_thread(filepath):
+                self._start_model_load_thread(filepath, "正在后台导入大 glTF 模型（性能模式）...")
+                return
             self._load_gltf_with_importer(filepath)
             return
 
-        # 启动加载线程
+        self._start_model_load_thread(filepath)
+
+    def _start_model_load_thread(self, filepath, status_text=None):
+        """启动后台加载线程，避免模型解析阻塞 UI 事件循环。"""
+        self._gltf_importer = None
+        if status_text:
+            self.status_label.setText(status_text)
         self._load_thread = ModelLoadThread(filepath)
         self._load_thread.progress.connect(self._on_load_progress)
         self._load_thread.finished.connect(self._on_load_finished)
         self._load_thread.error.connect(self._on_load_error)
         self._load_thread.start()
+
+    def _should_load_gltf_in_thread(self, filepath):
+        """大 glTF/GLB 使用 reader 线程路径，避免 importer 在主线程长时间阻塞。"""
+        return (
+            self._gltf_asset_size_bytes(filepath)
+            >= self.GLTF_THREADED_LOAD_THRESHOLD_BYTES
+        )
+
+    def _gltf_asset_size_bytes(self, filepath):
+        try:
+            total = os.path.getsize(filepath)
+        except OSError:
+            return 0
+
+        if os.path.splitext(filepath)[1].lower() != ".gltf":
+            return total
+
+        try:
+            gltf = self._read_gltf_json(filepath)
+        except Exception:
+            return total
+
+        base_dir = os.path.dirname(filepath)
+        for buffer_info in gltf.get("buffers") or []:
+            uri = str(buffer_info.get("uri") or "")
+            if not uri or uri.startswith("data:") or "://" in uri:
+                continue
+            buffer_path = os.path.normpath(os.path.join(base_dir, uri))
+            try:
+                total += os.path.getsize(buffer_path)
+            except OSError:
+                continue
+        return total
 
     def _load_gltf_with_importer(self, filepath):
         """用 vtkGLTFImporter 加载，保留完整材质/贴图。"""
@@ -853,6 +1082,7 @@ class MainWindow(QMainWindow):
                 )
                 actor_index += 1
 
+            self.vtk_widget.update_water_surface_to_scene(render=False)
             self.vtk_widget.reset_camera()
             self.progress_bar.setVisible(False)
 
@@ -878,7 +1108,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("加载失败")
             QMessageBox.critical(self, "加载错误", f"贴图加载失败: {str(e)}")
 
-    def _read_gltf_renderable_name_entries(self, filepath):
+    def _read_gltf_renderable_name_entries(self, filepath, attach_reader_bounds=True):
         try:
             gltf = self._read_gltf_json(filepath)
         except Exception:
@@ -988,8 +1218,52 @@ class MainWindow(QMainWindow):
                 visit(node_idx)
 
         name_entries = {"primitive": primitive_entries, "node": node_entries}
-        self._attach_gltf_reader_bounds(filepath, name_entries)
+        if attach_reader_bounds:
+            self._attach_gltf_reader_bounds(filepath, name_entries)
         return name_entries
+
+    def _apply_gltf_names_to_threaded_items(self, actors):
+        """Restore glTF node names for the threaded reader path used by large files."""
+        if not self._current_file:
+            return
+        if os.path.splitext(self._current_file)[1].lower() not in (".glb", ".gltf"):
+            return
+
+        name_entries = self._read_gltf_renderable_name_entries(
+            self._current_file,
+            attach_reader_bounds=False,
+        )
+        if not name_entries.get("node") and not name_entries.get("primitive"):
+            return
+
+        sub_items = [
+            sub_item
+            for item_data in actors
+            for sub_item in (item_data.get("sub_items") or [])
+        ]
+        if sub_items:
+            display_names = self._match_gltf_display_names(
+                name_entries,
+                [
+                    (sub.get("points", 0), sub.get("cells", 0))
+                    for sub in sub_items
+                ],
+            )
+            for sub_item, display_name in zip(sub_items, display_names):
+                if display_name:
+                    sub_item["name"] = display_name
+            return
+
+        display_names = self._match_gltf_display_names(
+            name_entries,
+            [
+                (item_data.get("points", 0), item_data.get("cells", 0))
+                for item_data in actors
+            ],
+        )
+        for item_data, display_name in zip(actors, display_names):
+            if display_name:
+                item_data["name"] = display_name
 
     def _attach_gltf_reader_bounds(self, filepath, name_entries):
         reader_entries = self._read_gltf_reader_geometry_entries(filepath)
@@ -1196,6 +1470,7 @@ class MainWindow(QMainWindow):
 
         # 清空旧场景
         self.vtk_widget.clear_scene()
+        self._apply_gltf_names_to_threaded_items(actors)
         self._loaded_items = actors
         self._actor_catalog_names.clear()
         self._actor_display_names.clear()
@@ -1248,6 +1523,8 @@ class MainWindow(QMainWindow):
             total_verts += points
             total_faces += cells
 
+        self.vtk_widget.update_water_surface_to_scene(render=False)
+
         # 重置相机
         self.vtk_widget.reset_camera()
 
@@ -1270,6 +1547,7 @@ class MainWindow(QMainWindow):
         """VTK视口模型点击事件"""
         if not actor_name:
             # 点击空白处，清除高亮和选中
+            self.vtk_widget.clear_selection_focus()
             self.vtk_widget.highlight_actor("")
             self._set_highlight_debug(self.vtk_widget.highlighted_names())
             self._update_geo_info_all(0, 0, self._get_loaded_object_count())
@@ -1279,10 +1557,11 @@ class MainWindow(QMainWindow):
             )
             self.catalog_table.setRowCount(0)
             self._current_catalog_matches = []
-            self._set_document_message("未选择文档")
+            self._set_document_message("未选择设备")
             return
 
         # 高亮
+        self.vtk_widget.clear_selection_focus()
         self.vtk_widget.highlight_actor(actor_name)
         self._set_highlight_debug(self.vtk_widget.highlighted_names())
         info = self.vtk_widget.get_actor_info(actor_name)
@@ -1324,6 +1603,7 @@ class MainWindow(QMainWindow):
                 matches = self._damage_display_matches([], object_matches)
             highlighted_names = self._selection_names_for_catalog_rows(object_matches)
             self.vtk_widget.highlight_actors(highlighted_names)
+            self.vtk_widget.focus_selection(highlighted_names)
             self._set_highlight_debug(self.vtk_widget.highlighted_names())
 
             highlight_text = (
@@ -1347,6 +1627,7 @@ class MainWindow(QMainWindow):
         actor_name = item.data(0, Qt.UserRole)
         if actor_name:
             self.vtk_widget.highlight_actor(actor_name)
+            self.vtk_widget.focus_selection([actor_name])
             self._set_highlight_debug(self.vtk_widget.highlighted_names())
             info = self.vtk_widget.get_actor_info(actor_name)
             if info:
@@ -1449,10 +1730,35 @@ class MainWindow(QMainWindow):
             return []
 
         matches = []
+        fuzzy_matches = []
+        lookup_key = self._normalize_catalog_match_text(catalog_key)
         for selection_name in self._actor_catalog_names:
-            if self._catalog_key_for_actor(selection_name) == catalog_key:
+            actor_key = self._catalog_key_for_actor(selection_name)
+            if actor_key == catalog_key:
                 matches.append(selection_name)
+                continue
+
+            candidate_texts = (
+                actor_key,
+                self._actor_catalog_names.get(selection_name, ""),
+                self._display_name_for_actor(selection_name),
+                selection_name,
+            )
+            if any(
+                lookup_key
+                and lookup_key in self._normalize_catalog_match_text(candidate)
+                for candidate in candidate_texts
+            ):
+                fuzzy_matches.append(selection_name)
+        matches.extend(
+            selection_name
+            for selection_name in fuzzy_matches
+            if selection_name not in matches
+        )
         return matches
+
+    def _normalize_catalog_match_text(self, text):
+        return str(text or "").strip().casefold()
 
     def _original_display_name(self, name, fallback):
         name = str(name or "").strip()
@@ -1497,10 +1803,13 @@ class MainWindow(QMainWindow):
             match_id = (
                 row["model_name"] if source_type == "model" else row["damage_leaf_id"]
             )
+            detail_status = (
+                "已配置" if self._device_detail_for_catalog_row(row) else "未配置"
+            )
             values = (
                 row["display_name"],
                 match_id or source_key,
-                os.path.basename(row["document_path"]) or row["document_path"],
+                detail_status,
             )
             for col_idx, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -1513,8 +1822,13 @@ class MainWindow(QMainWindow):
             self._display_catalog_row(0)
             return
 
+        device_row = self._device_detail_for_key(source_type, source_key)
+        if device_row:
+            self._show_device_detail(device_row, display_name)
+            return
+
         self._set_document_message(
-            f"未在文档目录中找到匹配项: {lookup_label} = {source_key}"
+            f"未找到设备详情: {lookup_label} = {source_key}"
         )
 
     def _on_catalog_row_clicked(self, row, column):
@@ -1522,27 +1836,87 @@ class MainWindow(QMainWindow):
 
     def _display_catalog_row(self, row_idx):
         if row_idx < 0 or row_idx >= len(self._current_catalog_matches):
-            self._set_document_message("未选择文档")
+            self._set_document_message("未选择设备")
             return
 
         row = self._current_catalog_matches[row_idx]
-        document_path = row["document_path"]
-        resolved_path = self._resolve_document_path(document_path)
         title = row["display_name"] or row["model_name"] or row["damage_leaf_id"]
+        device_row = self._device_detail_for_catalog_row(row)
 
-        if not document_path:
-            self._set_document_message(f"{title} 没有配置文档路径。")
+        if device_row is None:
+            self._set_document_message(f"未找到设备详情: {title}")
             return
 
+        self._show_device_detail(device_row, title)
+
+    def _device_detail_for_key(self, source_type, source_key):
+        if source_type == "model":
+            rows = self._device_catalog_by_model_name.get(source_key, [])
+        else:
+            rows = self._device_catalog_by_damage_leaf_id.get(source_key, [])
+            if not rows:
+                rows = self._device_catalog_by_model_name.get(source_key, [])
+        return rows[0] if rows else None
+
+    def _device_detail_for_catalog_row(self, catalog_row):
+        model_name = catalog_row.get("model_name", "")
+        damage_leaf_id = catalog_row.get("damage_leaf_id", "")
+
+        rows = self._device_catalog_by_model_name.get(model_name, [])
+        if rows:
+            return rows[0]
+
+        rows = self._device_catalog_by_damage_leaf_id.get(damage_leaf_id, [])
+        if rows:
+            return rows[0]
+
+        return None
+
+    def _show_device_detail(self, device_row, fallback_title=""):
+        title = (
+            device_row.get("display_name")
+            or device_row.get("model_name")
+            or device_row.get("damage_leaf_id")
+            or fallback_title
+        )
+        self._current_document_path = None
+        self.open_document_button.setEnabled(False)
+        self.device_title_label.setText(title or "未命名设备")
+
+        for field_key in ("material", "thickness", "size", "function"):
+            value = device_row.get(field_key) or "待补充"
+            self.device_field_labels[field_key].setText(value)
+
+        self._show_device_image(device_row.get("image_path", ""))
+        self.document_status_label.setText(f"正在显示设备详情: {title}")
+        self.document_view.setCurrentWidget(self.device_detail_view)
+
+    def _show_device_image(self, image_path):
+        resolved_path = self._resolve_device_image_path(image_path)
+        if not image_path:
+            self.device_image_label.setPixmap(QPixmap())
+            self.device_image_label.setText("未配置设备图片")
+            return
         if not os.path.exists(resolved_path):
-            self._set_document_message(
-                f"文档文件不存在: {document_path}\n解析路径: {resolved_path}"
-            )
+            self.device_image_label.setPixmap(QPixmap())
+            self.device_image_label.setText(f"设备图片不存在:\n{image_path}")
             return
 
-        self._current_document_path = resolved_path
-        self.open_document_button.setEnabled(True)
-        self._load_document_preview(resolved_path, title)
+        pixmap = QPixmap(resolved_path)
+        if pixmap.isNull():
+            self.device_image_label.setPixmap(QPixmap())
+            self.device_image_label.setText(f"设备图片无法读取:\n{image_path}")
+            return
+
+        target_size = self.device_image_label.size()
+        scaled = pixmap.scaled(
+            max(target_size.width(), 240),
+            260,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.device_image_label.setText("")
+        self.device_image_label.setPixmap(scaled)
 
     def _load_document_preview(self, resolved_path, title):
         filename = os.path.basename(resolved_path)
@@ -1617,7 +1991,7 @@ class MainWindow(QMainWindow):
         self.selection_meta_label.setText(
             "请选择模型中的 object，或点击左侧损伤树节点。"
         )
-        self._set_document_message("未选择文档")
+        self._set_document_message("未选择设备")
         self.vertex_label.setText("")
         self.status_label.setText("场景已清空")
         self.vtk_widget.refresh()
@@ -1791,7 +2165,7 @@ class MainWindow(QMainWindow):
         return
 
     def _update_geo_info_all(self, total_verts, total_faces, obj_count):
-        """右侧栏只显示当前选择和文档，不显示场景汇总。"""
+        """右侧栏只显示当前选择和设备详情，不显示场景汇总。"""
         return
 
     def _show_about(self):
@@ -1815,7 +2189,6 @@ class MainWindow(QMainWindow):
             "<li>0 - 等轴测视图</li>"
             "<li>R - 重置视角</li>"
             "<li>W - 线框模式</li>"
-            "<li>G - 显示/隐藏网格</li>"
             "</ul>",
         )
 

@@ -1,0 +1,162 @@
+[
+  {
+    "model_name": "Object_47",
+    "display_name": "车窗",
+    "damage_leaf_id": "WINDOW_SIDE",
+    "image_path": "images/devices/object-47.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "Object_32",
+    "display_name": "车框",
+    "damage_leaf_id": "WINDOW_SIDE",
+    "image_path": "images/devices/object-32.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "Object_26",
+    "display_name": "侧窗",
+    "damage_leaf_id": "WINDOW_SIDE",
+    "image_path": "images/devices/object-26.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "Object_36",
+    "display_name": "后窗",
+    "damage_leaf_id": "WINDOW_REAR",
+    "image_path": "images/devices/object-36.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "Object_130",
+    "display_name": "车灯",
+    "damage_leaf_id": "LIGHT_FRONT",
+    "image_path": "images/devices/object-130.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "Object_64",
+    "display_name": "车标",
+    "damage_leaf_id": "BRAND_LOGO",
+    "image_path": "images/devices/object-64.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "Object_12",
+    "display_name": "右前轮胎",
+    "damage_leaf_id": "WHEEL_FRONT_RIGHT",
+    "image_path": "images/devices/object-12.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "Object_9",
+    "display_name": "右后轮胎",
+    "damage_leaf_id": "WHEEL_REAR_RIGHT",
+    "image_path": "images/devices/object-9.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "Object_89",
+    "display_name": "左前轮胎",
+    "damage_leaf_id": "WHEEL_FRONT_LEFT",
+    "image_path": "images/devices/object-89.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "Object_118",
+    "display_name": "左后轮胎",
+    "damage_leaf_id": "WHEEL_REAR_LEFT",
+    "image_path": "images/devices/object-118.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "ROOT",
+    "display_name": "整车层级",
+    "damage_leaf_id": "ROOT",
+    "image_path": "images/devices/root.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "BODY",
+    "display_name": "车身外观层级",
+    "damage_leaf_id": "BODY",
+    "image_path": "images/devices/body.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "WINDOW_SYSTEM",
+    "display_name": "车窗系统层级",
+    "damage_leaf_id": "WINDOW_SYSTEM",
+    "image_path": "images/devices/window-system.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "LIGHT_SYSTEM",
+    "display_name": "灯光系统层级",
+    "damage_leaf_id": "LIGHT_SYSTEM",
+    "image_path": "images/devices/light-system.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "BRAND_SYSTEM",
+    "display_name": "品牌标识层级",
+    "damage_leaf_id": "BRAND_SYSTEM",
+    "image_path": "images/devices/brand-system.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  },
+  {
+    "model_name": "WHEEL_SYSTEM",
+    "display_name": "轮胎系统层级",
+    "damage_leaf_id": "WHEEL_SYSTEM",
+    "image_path": "images/devices/wheel-system.png",
+    "material": "待补充",
+    "thickness": "待补充",
+    "size": "待补充",
+    "function": "待补充"
+  }
+]
