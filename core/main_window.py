@@ -9,6 +9,7 @@ import json
 import os
 import re
 import struct
+import unicodedata
 from collections import defaultdict
 import vtk
 
@@ -591,7 +592,7 @@ class MainWindow(QMainWindow):
         self._pdf_catalog_rows = rows
         for row in rows:
             model_name = row["model_name"]
-            damage_leaf_id = row["damage_leaf_id"]
+            damage_leaf_id = self._normalize_damage_id(row["damage_leaf_id"])
             if model_name:
                 self._pdf_catalog_by_model_name[model_name].append(row)
             if damage_leaf_id:
@@ -659,7 +660,7 @@ class MainWindow(QMainWindow):
         self._device_catalog_rows = rows
         for row in rows:
             model_name = row["model_name"]
-            damage_leaf_id = row["damage_leaf_id"]
+            damage_leaf_id = self._normalize_damage_id(row["damage_leaf_id"])
             if model_name:
                 self._device_catalog_by_model_name[model_name].append(row)
             if damage_leaf_id:
@@ -775,10 +776,12 @@ class MainWindow(QMainWindow):
         nodes_by_id = {}
         duplicate_ids = []
         for row in rows:
-            node_id = row["node_id"]
+            node_id = self._normalize_damage_id(row["node_id"])
             if node_id in nodes_by_id:
                 duplicate_ids.append(node_id)
                 continue
+            row["node_id"] = node_id
+            row["parent_id"] = self._normalize_damage_id(row["parent_id"])
             nodes_by_id[node_id] = row
 
         children_map = defaultdict(list)
@@ -835,7 +838,7 @@ class MainWindow(QMainWindow):
             return
 
         for pose in data.get("poses") or []:
-            node_id = str(pose.get("node_id") or "").strip()
+            node_id = self._normalize_damage_id(pose.get("node_id"))
             if not node_id:
                 continue
             if self._is_valid_damage_camera_pose(pose):
@@ -1638,7 +1641,7 @@ class MainWindow(QMainWindow):
 
     def _on_tree_item_clicked(self, item, column):
         """树节点点击事件"""
-        node_id = item.data(0, self.DAMAGE_NODE_ID_ROLE)
+        node_id = self._normalize_damage_id(item.data(0, self.DAMAGE_NODE_ID_ROLE))
         if node_id:
             if item.childCount() > 0:
                 item.setExpanded(not item.isExpanded())
@@ -1717,26 +1720,29 @@ class MainWindow(QMainWindow):
         return leaf_ids
 
     def _node_catalog_rows(self, node_id):
+        normalized_node_id = self._normalize_damage_id(node_id)
         return [
             row
-            for row in self._pdf_catalog_by_model_name.get(node_id, [])
+            for row in self._pdf_catalog_rows
+            if self._normalize_damage_id(row.get("model_name", "")) == normalized_node_id
             if self._is_damage_node_catalog_row(row)
         ]
 
     def _object_catalog_rows_for_damage_ids(self, damage_ids):
         rows = []
         for damage_id in damage_ids:
-            for row in self._pdf_catalog_by_damage_leaf_id.get(damage_id, []):
+            normalized_damage_id = self._normalize_damage_id(damage_id)
+            for row in self._pdf_catalog_by_damage_leaf_id.get(normalized_damage_id, []):
                 if self._is_damage_node_catalog_row(row):
                     continue
                 rows.append(row)
         return rows
 
     def _is_damage_node_catalog_row(self, row):
-        model_name = row.get("model_name", "")
+        model_name = self._normalize_damage_id(row.get("model_name", ""))
         if model_name not in self._damage_node_ids:
             return False
-        damage_leaf_id = row.get("damage_leaf_id", "")
+        damage_leaf_id = self._normalize_damage_id(row.get("damage_leaf_id", ""))
         return not damage_leaf_id or damage_leaf_id == model_name
 
     def _set_highlight_debug(self, object_names):
@@ -1919,7 +1925,7 @@ class MainWindow(QMainWindow):
 
     def _device_detail_for_catalog_row(self, catalog_row):
         model_name = catalog_row.get("model_name", "")
-        damage_leaf_id = catalog_row.get("damage_leaf_id", "")
+        damage_leaf_id = self._normalize_damage_id(catalog_row.get("damage_leaf_id", ""))
 
         rows = self._device_catalog_by_model_name.get(model_name, [])
         if rows:
@@ -1930,6 +1936,10 @@ class MainWindow(QMainWindow):
             return rows[0]
 
         return None
+
+    def _normalize_damage_id(self, value):
+        text = unicodedata.normalize("NFKC", str(value or ""))
+        return text.strip()
 
     def _show_device_detail(self, device_row, fallback_title=""):
         title = (

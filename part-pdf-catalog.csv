@@ -6,7 +6,7 @@ Object_36,后窗,test3.pdf,WINDOW_REAR
 Object_130,车灯,test5.pdf,LIGHT_FRONT
 Object_64,车标,test4.pdf,BRAND_LOGO
 Object_12,右前轮胎,/assets/richtext/object-9.html,WHEEL_FRONT_RIGHT
-Object_9,右后轮胎,/assets/richtext/object-12.html,WHEEL_REAR_RIGHT
+Object_9,右后轮胎,/assets/richtext/object-12.html,右后轮
 Object_89,左前轮胎,/assets/richtext/object-89.html,WHEEL_FRONT_LEFT
 Object_118,左后轮胎,/assets/richtext/object-118.html,WHEEL_REAR_LEFT
 ROOT,整车层级,/assets/richtext/object-47.html,ROOT

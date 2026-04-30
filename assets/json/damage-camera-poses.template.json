@@ -142,7 +142,7 @@
       "distance": 100.0
     },
     {
-      "node_id": "WHEEL_REAR_RIGHT",
+      "node_id": "右后轮",
       "name": "右后轮胎",
       "position": [
         0.0,
