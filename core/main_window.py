@@ -937,9 +937,6 @@ class MainWindow(QMainWindow):
 
         ext = os.path.splitext(filepath)[1].lower()
         if ext in (".glb", ".gltf"):
-            if self._should_load_gltf_in_thread(filepath):
-                self._start_model_load_thread(filepath, "正在后台导入大 glTF 模型（性能模式）...")
-                return
             self._load_gltf_with_importer(filepath)
             return
 
@@ -1009,7 +1006,10 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(60)
             self.status_label.setText("正在优化贴图质量...")
 
-            gltf_name_entries = self._read_gltf_renderable_name_entries(filepath)
+            gltf_name_entries = self._read_gltf_renderable_name_entries(
+                filepath,
+                attach_reader_bounds=False,
+            )
             imported = importer.GetImportedActors()
             imported.InitTraversal()
             imported_count = imported.GetNumberOfItems()
@@ -1026,10 +1026,11 @@ class MainWindow(QMainWindow):
                 if actor is None:
                     break
 
-                if self._actor_has_any_texture(actor):
+                has_texture = self._actor_has_any_texture(actor)
+                if has_texture:
                     textured_count += 1
                 self._optimize_actor_texture(actor, max_texture_size=texture_max_size)
-                self._optimize_actor_material_for_speed(actor)
+                self._optimize_actor_material_for_speed(actor, has_texture=has_texture)
                 points, cells = self._get_actor_geometry_stats(actor)
                 imported_actors.append(
                     (
@@ -1082,8 +1083,11 @@ class MainWindow(QMainWindow):
                 )
                 actor_index += 1
 
-            self.vtk_widget.update_water_surface_to_scene(render=False)
-            self.vtk_widget.reset_camera()
+            scene_bounds = self.vtk_widget.get_scene_model_bounds()
+            self.vtk_widget.update_water_surface_to_scene(
+                render=False, scene_bounds=scene_bounds
+            )
+            self.vtk_widget.reset_camera(scene_bounds=scene_bounds)
             self.progress_bar.setVisible(False)
 
             if object_count == 0:
@@ -2103,13 +2107,15 @@ class MainWindow(QMainWindow):
         resize.Update()
         texture.SetInputData(resize.GetOutput())
 
-    def _optimize_actor_material_for_speed(self, actor):
+    def _optimize_actor_material_for_speed(self, actor, has_texture=None):
         """保持贴图可见，降低材质计算复杂度。"""
         prop = actor.GetProperty()
         if prop is None:
             return
         # Keep glTF/PBR textured materials intact; forcing Gouraud can drop PBR textures.
-        if self._actor_has_any_texture(actor):
+        if has_texture is None:
+            has_texture = self._actor_has_any_texture(actor)
+        if has_texture:
             if hasattr(prop, "SetInterpolationToPBR"):
                 prop.SetInterpolationToPBR()
             return
