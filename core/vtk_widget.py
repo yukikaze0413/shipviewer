@@ -151,7 +151,6 @@ class VTKWidget(QWidget):
     FOCUS_FRAME_PADDING = 1.28
     FOCUS_DIM_OPACITY = 0.08
     WATER_DEFAULT_SIZE = 180.0
-    WATER_SIZE_MULTIPLIER = 16.0
     WATER_TILE_SIZE = 24.0
 
     # 信号
@@ -182,7 +181,6 @@ class VTKWidget(QWidget):
         self._water_tcoords = None
         self._water_texture = None
         self._water_texture_reader = None
-        self._water_y = 0.0
         self._dynamic_hidden_actor_names = set()
         self._dynamic_hide_active = False
         self._focus_dimmed_actor_state = {}
@@ -332,7 +330,6 @@ class VTKWidget(QWidget):
         self.renderer.AddViewProp(annotation)
 
     def _on_render_start(self, obj, event):
-        self._clamp_active_camera_above_water()
         self._update_camera_debug_overlay()
 
     def _format_vector(self, vector):
@@ -503,9 +500,8 @@ class VTKWidget(QWidget):
             span_z = bounds[5] - bounds[4]
             horizontal_span = max(span_x, span_z, self.WATER_DEFAULT_SIZE)
             water_y = bounds[2] - max(horizontal_span * 0.015, 0.1)
-            size = horizontal_span * self.WATER_SIZE_MULTIPLIER
+            size = horizontal_span * 2.6
 
-        self._water_y = water_y
         half = size * 0.5
         points = (
             (center_x - half, water_y, center_z - half),
@@ -639,24 +635,7 @@ class VTKWidget(QWidget):
             camera.Dolly(1.0 / zoom_factor)
             self._clamp_camera_distance(camera)
 
-    def _minimum_camera_y(self):
-        return self._water_y + 0.05
-
-    def _clamp_camera_above_water(self, camera):
-        if camera is None:
-            return False
-        position = camera.GetPosition()
-        min_y = self._minimum_camera_y()
-        if position[1] >= min_y:
-            return False
-        camera.SetPosition(position[0], min_y, position[2])
-        return True
-
-    def _clamp_active_camera_above_water(self):
-        return self._clamp_camera_above_water(self.renderer.GetActiveCamera())
-
     def _finalize_camera_zoom(self):
-        self._clamp_active_camera_above_water()
         self.renderer.ResetCameraClippingRange()
         self.render_window.Render()
 
@@ -1034,54 +1013,6 @@ class VTKWidget(QWidget):
     def set_view_iso(self):
         self.reset_camera()
 
-    def set_camera_pose(self, pose):
-        camera = self.renderer.GetActiveCamera()
-        if camera is None:
-            return False
-
-        try:
-            focal_point = tuple(float(value) for value in pose["focal_point"])
-        except (KeyError, TypeError, ValueError):
-            return False
-
-        position = None
-        direction = pose.get("direction")
-        distance = pose.get("distance")
-        if direction is not None and distance is not None:
-            try:
-                direction = self._normalize_vector(
-                    tuple(float(value) for value in direction)
-                )
-                distance = min(float(distance), self.CAMERA_MAX_DISTANCE)
-                position = (
-                    focal_point[0] + direction[0] * distance,
-                    focal_point[1] + direction[1] * distance,
-                    focal_point[2] + direction[2] * distance,
-                )
-            except (TypeError, ValueError):
-                position = None
-
-        if position is None:
-            try:
-                position = tuple(float(value) for value in pose["position"])
-            except (KeyError, TypeError, ValueError):
-                return False
-
-        view_up = pose.get("view_up", (0.0, 1.0, 0.0))
-        try:
-            view_up = self._normalize_vector(tuple(float(value) for value in view_up))
-        except (TypeError, ValueError):
-            view_up = (0.0, 1.0, 0.0)
-
-        camera.SetFocalPoint(*focal_point)
-        camera.SetPosition(*position)
-        self._clamp_camera_above_water(camera)
-        camera.SetViewUp(*view_up)
-        camera.SetRoll(0.0)
-        self.renderer.ResetCameraClippingRange()
-        self.render_window.Render()
-        return True
-
     def _reset_camera_to_direction(self, direction, view_up, scene_bounds=None):
         bounds = scene_bounds if scene_bounds is not None else self._get_scene_model_bounds()
         if bounds is None:
@@ -1110,7 +1041,6 @@ class VTKWidget(QWidget):
             center[1] + direction[1] * distance,
             center[2] + direction[2] * distance,
         )
-        self._clamp_camera_above_water(camera)
         camera.SetViewUp(*view_up)
         # 注意：这里暂时不调用 camera.OrthogonalizeViewUp()。
         # 原因是当前俯视调参阶段需要保留传入的原始 view_up 语义，便于通过调试框观察输入效果；

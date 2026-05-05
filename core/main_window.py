@@ -94,12 +94,6 @@ class MainWindow(QMainWindow):
             ("assets", "json", "device-catalog.json"),
             "device-catalog.json",
         )
-        self._damage_camera_poses_path = self._resolve_data_file(
-            ("assets", "json", "damage-camera-poses.json"),
-            ("assets", "json", "damage-camera-poses.template.json"),
-            "damage-camera-poses.json",
-            "damage-camera-poses.template.json",
-        )
         self._viewport_background_path = self._resolve_background_hdr_path()
         self._water_texture_path = self._resolve_data_file(
             ("assets", "water", "water_diffuse.jpg"),
@@ -117,7 +111,6 @@ class MainWindow(QMainWindow):
         self._damage_nodes_by_id = {}
         self._damage_children_by_id = defaultdict(list)
         self._damage_node_ids = set()
-        self._damage_camera_poses_by_id = {}
         self._current_catalog_matches = []
         self._current_document_path = None
         self._actor_catalog_names = {}
@@ -133,7 +126,6 @@ class MainWindow(QMainWindow):
         self._load_pdf_catalog_from_csv()
         self._load_device_catalog_from_json()
         self._load_damage_tree_from_csv()
-        self._load_damage_camera_poses()
 
         # 信号连接
         self.vtk_widget.model_clicked.connect(self._on_vtk_model_clicked)
@@ -1658,8 +1650,7 @@ class MainWindow(QMainWindow):
                 matches = self._damage_display_matches([], object_matches)
             highlighted_names = self._selection_names_for_catalog_rows(object_matches)
             self.vtk_widget.highlight_actors(highlighted_names)
-            if not self._apply_damage_camera_pose(node_id):
-                self.vtk_widget.focus_selection(highlighted_names)
+            self.vtk_widget.focus_selection(highlighted_names)
             self._set_highlight_debug(self.vtk_widget.highlighted_names())
 
             highlight_text = (
@@ -1702,12 +1693,6 @@ class MainWindow(QMainWindow):
                 matches=self._pdf_catalog_by_model_name.get(catalog_key, []),
                 meta="  |  ".join(meta_parts),
             )
-
-    def _apply_damage_camera_pose(self, node_id):
-        pose = self._damage_camera_poses_by_id.get(node_id)
-        if not pose:
-            return False
-        return self.vtk_widget.set_camera_pose(pose)
 
     def _descendant_leaf_node_ids(self, item):
         if item.childCount() == 0:
