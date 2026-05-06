@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "camera_max_distance": 1500.0,
+  "_comment": "direction uses the debug overlay meaning: center->camera. When position is present it wins; when position equals focal_point, direction+distance is used as fallback.",
+  "poses": [
+    {
+      "node_id": "WINDOW_SIDE",
+      "name": "side window",
+      "position": [
+        120.0,
+        45.0,
+        30.0
+      ],
+      "focal_point": [
+        5.0,
+        8.0,
+        0.0
+      ],
+      "direction": [
+        0.928,
+        0.299,
+        0.242
+      ],
+      "distance": 124.0,
+      "view_up": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "node_id": "WINDOW_REAR",
+      "name": "rear window",
+      "position": [
+        -90.0,
+        60.0,
+        -140.0
+      ],
+      "focal_point": [
+        -12.0,
+        10.0,
+        -18.0
+      ],
+      "direction": [
+        -0.508,
+        0.325,
+        -0.798
+      ],
+      "distance": 153.0,
+      "view_up": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "node_id": "LIGHT_FRONT",
+      "name": "front light",
+      "position": [
+        35.0,
+        22.0,
+        160.0
+      ],
+      "focal_point": [
+        8.0,
+        6.0,
+        20.0
+      ],
+      "direction": [
+        0.188,
+        0.111,
+        0.976
+      ],
+      "distance": 143.0,
+      "view_up": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "node_id": "BRAND_LOGO",
+      "name": "brand logo",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "focal_point": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "direction": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "distance": 100.0
+    },
+    {
+      "node_id": "WHEEL_FRONT_LEFT",
+      "name": "front left wheel",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "focal_point": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "direction": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "distance": 100.0
+    },
+    {
+      "node_id": "WHEEL_FRONT_RIGHT",
+      "name": "front right wheel",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "focal_point": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "direction": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "distance": 100.0
+    },
+    {
+      "node_id": "WHEEL_REAR_LEFT",
+      "name": "rear left wheel",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "focal_point": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "direction": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "distance": 100.0
+    },
+    {
+      "node_id": "WHEEL_REAR_RIGHT",
+      "name": "rear right wheel",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "focal_point": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "direction": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "distance": 100.0
+    },
+    {
+      "node_id": "fan",
+      "name": "yepian",
+      "position": [
+        243.7,
+        152.0,
+        -609.1
+      ],
+      "focal_point": [
+        0.0,
+        85.2,
+        -37.5
+      ],
+      "direction": [
+        -0.39,
+        -0.1,
+        0.9
+      ],
+      "distance": 625.0
+    }
+  ]
+}

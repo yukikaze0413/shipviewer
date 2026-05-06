@@ -25,9 +25,9 @@
 
 | 字段 | 是否必填 | 填写说明 |
 | --- | --- | --- |
-| `model_name` | 是 | 模型对象名称，必须和 `part-pdf-catalog.csv` 第一列“模型名称”一致，例如 `Object_47`。 |
+| `model_name` | 是 | 模型对象名称，必须和模型导入后显示的对象名一致，例如 `Object_47` 或 `对象_381`。 |
 | `display_name` | 是 | 右侧展示的设备名称，例如 `车窗`。 |
-| `damage_leaf_id` | 建议填写 | 损伤树节点 ID，建议和 `part-pdf-catalog.csv` 第四列“毁伤叶子ID”一致，例如 `WINDOW_SIDE`。 |
+| `damage_leaf_id` | 建议填写 | 损伤树节点 ID，用于点击损伤树时反查并高亮对应模型，例如 `WINDOW_SIDE`。 |
 | `image_path` | 建议填写 | 设备图片路径，推荐放在 `assets/images/devices/` 下，并填写相对 `assets/` 的路径。 |
 | `material` | 是 | 材质，例如 `钢化玻璃`、`橡胶`、`铝合金`。 |
 | `thickness` | 是 | 厚度，例如 `6 mm`。无固定厚度时可填 `不适用`。 |
@@ -52,19 +52,19 @@ assets/images/devices/
 
 ## 匹配关系
 
-程序优先用 `model_name` 匹配设备详情：
+程序用 `model_name` 匹配模型对象：
 
 ```text
-part-pdf-catalog.csv 的 模型名称  <->  device-catalog.json 的 model_name
+模型对象名称  <->  device-catalog.json 的 model_name
 ```
 
-点击损伤树节点时，也会用 `damage_leaf_id` 辅助匹配：
+点击损伤树节点时，用 `damage_leaf_id` 找到应高亮的设备行：
 
 ```text
-part-pdf-catalog.csv 的 毁伤叶子ID  <->  device-catalog.json 的 damage_leaf_id
+damage-tree-nodes.csv 的 节点ID  <->  device-catalog.json 的 damage_leaf_id
 ```
 
-因此新增设备时，最重要的是保证 `model_name` 和 CSV 第一列一致。
+因此新增设备时，最重要的是保证 `model_name` 和模型对象名一致，并把 `damage_leaf_id` 填成对应的损伤树节点 ID。
 
 ## 新增设备步骤
 

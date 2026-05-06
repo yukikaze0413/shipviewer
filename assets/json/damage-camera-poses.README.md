@@ -10,6 +10,12 @@ assets/json/damage-camera-poses.json
 
 ## 字段说明
 
+顶层字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `camera_max_distance` | 相机允许拉远的最大 distance，数字；不填或小于等于 0 时使用程序默认值。 |
+
 每个 `poses` 项对应一个损伤树节点。
 
 
@@ -27,19 +33,26 @@ assets/json/damage-camera-poses.json
 1. 打开程序里的相机调试功能。
 2. 手动旋转、缩放到希望点击损伤树后显示的角度。
 3. 把调试框里的 `position`、`focal_point`、`direction`、`distance` 复制到对应 `node_id`。
-4. 保存 JSON。
-5. 后续实现读取逻辑后，重启程序即可生效。
+4. 如需允许相机拉得更远，修改顶层 `camera_max_distance`。
+5. 保存 JSON。
+6. 重启程序即可生效。
 
 ## 示例
 
 ```json
 {
-  "node_id": "WINDOW_SIDE",
-  "name": "侧窗",
-  "position": [12.34, 8.9, 56.78],
-  "focal_point": [1.2, 3.4, 5.6],
-  "direction": [0.12, 0.34, 0.93],
-  "distance": 62.5
+  "version": 1,
+  "camera_max_distance": 750.0,
+  "poses": [
+    {
+      "node_id": "WINDOW_SIDE",
+      "name": "侧窗",
+      "position": [12.34, 8.9, 56.78],
+      "focal_point": [1.2, 3.4, 5.6],
+      "direction": [0.12, 0.34, 0.93],
+      "distance": 62.5
+    }
+  ]
 }
 ```
 

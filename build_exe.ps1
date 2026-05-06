@@ -37,7 +37,7 @@ foreach ($dir in $assetDirs) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 
-$csvFiles = @("damage-tree-nodes.csv", "part-pdf-catalog.csv")
+$csvFiles = @("damage-tree-nodes.csv")
 foreach ($csvFile in $csvFiles) {
     $source = Join-Path $ProjectRoot $csvFile
     if (Test-Path $source) {
@@ -48,11 +48,6 @@ foreach ($csvFile in $csvFiles) {
 $backgroundSource = Join-Path $ProjectRoot "assets\backgrounds"
 if (Test-Path $backgroundSource) {
     Copy-Item (Join-Path $backgroundSource "*.hdr") (Join-Path $AssetsRoot "backgrounds") -Force -ErrorAction SilentlyContinue
-}
-
-$pdfSource = Join-Path $ProjectRoot "pdfs"
-if (Test-Path $pdfSource) {
-    Copy-Item (Join-Path $pdfSource "*") (Join-Path $AssetsRoot "pdfs") -Recurse -Force
 }
 
 $jsonSource = Join-Path $ProjectRoot "assets\json"
@@ -76,20 +71,17 @@ ShipViewer external assets
 
 Editable files are stored in the assets folder next to ShipViewer.exe:
 - assets\csv\damage-tree-nodes.csv
-- assets\csv\part-pdf-catalog.csv
 - assets\json\device-catalog.json
 - assets\images\devices\*.png, *.jpg, *.jpeg
-- assets\pdfs\*.pdf
 - assets\backgrounds\*.hdr
 - assets\water\water_diffuse.jpg, water_diffuse.png, or material.png
 
-In part-pdf-catalog.csv, document paths can be file names such as test.pdf,
-or relative paths such as assets/pdfs/test.pdf.
+Device highlighting and detail data are read from assets\json\device-catalog.json.
 Water textures are optional. If no water texture is found, ShipViewer uses
 a simple translucent water surface.
 HDR backgrounds are scanned from assets/backgrounds. Use background.hdr for
 the highest priority, or place any .hdr file in that folder.
-After replacing CSV, JSON, images, PDF, HDR, or water texture files, restart ShipViewer.exe
+After replacing CSV, JSON, images, HDR, or water texture files, restart ShipViewer.exe
 to reload them.
 "@ | Set-Content -Path $readmePath -Encoding UTF8
 

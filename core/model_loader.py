@@ -3,6 +3,7 @@
 支持 .3dm (Rhino) 和 .glb (glTF Binary) 格式
 """
 import os
+import sys
 import vtk
 from PySide6.QtCore import QThread, Signal
 
@@ -18,6 +19,8 @@ class ModelLoadThread(QThread):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
         self.filepath = filepath
+        self._current_model_dir = ""
+        self._object_index_by_id = {}
 
     def run(self):
         try:
@@ -35,23 +38,49 @@ class ModelLoadThread(QThread):
             if actors:
                 self.finished.emit(actors, f"成功加载 {len(actors)} 个对象")
             else:
+                diagnostics = getattr(self, "_last_3dm_diagnostics", [])
+                if ext == ".3dm" and diagnostics:
+                    preview = "\n".join(diagnostics[:12])
+                    extra = "" if len(diagnostics) <= 12 else f"\n... 另有 {len(diagnostics) - 12} 项"
+                    self.error.emit(
+                        "未能从文件中提取任何可显示网格。\n"
+                        "可能原因：文件里只有曲线/点/未保存渲染网格的 NURBS 曲面，"
+                        "或对象类型暂不支持。\n\n"
+                        f"对象诊断:\n{preview}{extra}"
+                    )
+                    return
                 self.error.emit("未能从文件中提取任何几何体")
         except Exception as e:
             self.error.emit(f"加载失败: {str(e)}")
 
     def _load_3dm(self, filepath):
         """加载 Rhino .3dm 文件"""
-        import rhino3dm
+        try:
+            import rhino3dm
+        except ImportError as exc:
+            raise RuntimeError(
+                "当前 Python 环境缺少 rhino3dm，无法加载 3DM 文件。\n"
+                f"解释器: {sys.executable}\n"
+                "请使用项目的 启动查看器.bat 启动，或在当前环境执行: "
+                "python -m pip install -r requirements.txt"
+            ) from exc
 
         self.progress.emit(20, "正在读取 3DM 文件...")
         model = rhino3dm.File3dm.Read(filepath)
         if model is None:
             raise RuntimeError("无法读取 3DM 文件")
 
+        self._current_model_dir = os.path.dirname(os.path.abspath(filepath))
         actors = []
+        self._last_3dm_diagnostics = []
         total = len(model.Objects)
         if total == 0:
             raise RuntimeError("3DM 文件中没有几何对象")
+        self._object_index_by_id = {}
+        for index, model_obj in enumerate(model.Objects):
+            object_id = getattr(model_obj.Attributes, "Id", None)
+            if object_id:
+                self._object_index_by_id[str(object_id)] = index
 
         # 预定义工业风配色
         colors = [
@@ -68,93 +97,426 @@ class ModelLoadThread(QThread):
             percent = 20 + int(70 * (i + 1) / total)
             self.progress.emit(percent, f"正在处理对象 {i + 1}/{total}...")
 
-            geo = obj.Geometry
-            attr = obj.Attributes
-
-            # 获取对象名称
-            name = attr.Name if attr.Name else f"对象_{i}"
-
-            mesh = None
-            # 尝试从不同类型的几何体获取网格
-            geo_type = type(geo).__name__
-
-            if geo_type == "Mesh":
-                mesh = geo
-            elif geo_type == "Brep":
-                # 对Brep进行网格化
-                try:
-                    meshes = rhino3dm.Mesh.CreateFromBrep(geo)
-                    if meshes and len(meshes) > 0:
-                        mesh = meshes[0]
-                        for m in meshes[1:]:
-                            mesh.Append(m)
-                except Exception:
-                    continue
-            elif geo_type == "Extrusion":
-                try:
-                    brep = geo.ToBrep()
-                    if brep:
-                        meshes = rhino3dm.Mesh.CreateFromBrep(brep)
-                        if meshes and len(meshes) > 0:
-                            mesh = meshes[0]
-                            for m in meshes[1:]:
-                                mesh.Append(m)
-                except Exception:
-                    continue
-            elif hasattr(geo, "GetMesh"):
-                try:
-                    mesh = geo.GetMesh(rhino3dm.MeshType.Default)
-                except Exception:
-                    continue
-
-            if mesh is None:
-                continue
-
-            # 转换为VTK
-            vtk_actor = self._rhino_mesh_to_vtk(mesh, name)
-            if vtk_actor is None:
-                continue
-
-            # 设置颜色
-            if attr.ColorSource == rhino3dm.ObjectColorSource.ColorFromObject:
-                color = attr.ObjectColor
-                r, g, b = color.R / 255.0, color.G / 255.0, color.B / 255.0
-            else:
-                color_idx = i % len(colors)
-                r, g, b = colors[color_idx]
-
-            self._configure_actor_material(vtk_actor, (r, g, b))
-            points, cells = self._get_actor_geometry_stats(vtk_actor)
-            actors.append({
-                "actor": vtk_actor,
-                "name": name,
-                "type": geo_type,
-                "points": points,
-                "cells": cells,
-            })
+            entries = self._rhino_object_to_actor_entries(
+                rhino3dm,
+                model,
+                obj,
+                object_index=i,
+                fallback_colors=colors,
+            )
+            actors.extend(entries)
 
         self.progress.emit(100, "加载完成")
         return actors
+
+    def _rhino_object_to_actor_entries(
+        self,
+        rhino3dm,
+        model,
+        obj,
+        object_index=0,
+        fallback_colors=None,
+        transform=None,
+        visited_instance_ids=None,
+    ):
+        attr = obj.Attributes
+        geo = obj.Geometry
+        geo_type = type(geo).__name__
+        name = attr.Name if attr.Name else f"对象_{object_index}"
+        fallback_colors = fallback_colors or [(0.60, 0.72, 0.78)]
+        visited_instance_ids = visited_instance_ids or set()
+
+        if geo_type == "InstanceReference":
+            return self._rhino_instance_to_actor_entries(
+                rhino3dm,
+                model,
+                geo,
+                object_index,
+                fallback_colors,
+                transform,
+                visited_instance_ids,
+            )
+
+        material = self._rhino_object_material(rhino3dm, model, attr)
+        color = self._rhino_object_color(
+            rhino3dm, model, attr, material, object_index, fallback_colors
+        )
+        texture = self._rhino_material_texture(material)
+        entries = []
+        meshes = self._rhino_geometry_to_meshes(rhino3dm, geo, transform)
+        is_split = len(meshes) > 1
+        for mesh_index, mesh in enumerate(meshes):
+            entry_name = name if not is_split else f"{name}_{mesh_index + 1}"
+            vtk_actor = self._rhino_mesh_to_vtk(mesh, entry_name)
+            if vtk_actor is None:
+                continue
+            self._configure_actor_material(vtk_actor, color, texture)
+            points, cells = self._get_actor_geometry_stats(vtk_actor)
+            entries.append(
+                {
+                    "actor": vtk_actor,
+                    "name": entry_name,
+                    "base_name": name,
+                    "is_split": is_split,
+                    "type": geo_type,
+                    "points": points,
+                    "cells": cells,
+                }
+            )
+
+        if not entries:
+            self._last_3dm_diagnostics.append(f"{name}: {geo_type} 未找到可显示网格")
+        return entries
+
+    def _rhino_instance_to_actor_entries(
+        self,
+        rhino3dm,
+        model,
+        instance_ref,
+        object_index,
+        fallback_colors,
+        transform,
+        visited_instance_ids,
+    ):
+        idef_id = getattr(instance_ref, "ParentIdefId", None)
+        if not idef_id:
+            return []
+        idef_key = str(idef_id)
+        if idef_key in visited_instance_ids:
+            self._last_3dm_diagnostics.append(f"块实例循环引用: {idef_key}")
+            return []
+
+        idef = model.InstanceDefinitions.FindId(idef_id)
+        if idef is None:
+            self._last_3dm_diagnostics.append(f"未找到块定义: {idef_key}")
+            return []
+
+        instance_xform = getattr(instance_ref, "Xform", None)
+        composed = self._compose_rhino_transform(rhino3dm, transform, instance_xform)
+        entries = []
+        next_visited = set(visited_instance_ids)
+        next_visited.add(idef_key)
+        for child_id in idef.GetObjectIds() or []:
+            child_obj = model.Objects.FindId(child_id)
+            if child_obj is None:
+                continue
+            child_index = self._rhino_object_index(child_obj, object_index)
+            entries.extend(
+                self._rhino_object_to_actor_entries(
+                    rhino3dm,
+                    model,
+                    child_obj,
+                    object_index=child_index,
+                    fallback_colors=fallback_colors,
+                    transform=composed,
+                    visited_instance_ids=next_visited,
+                )
+            )
+        return entries
+
+    def _rhino_geometry_to_meshes(self, rhino3dm, geo, transform=None):
+        geo_type = type(geo).__name__
+        meshes = []
+
+        if geo_type == "Mesh":
+            meshes.append(geo)
+        elif geo_type == "Brep":
+            meshes.extend(self._rhino_brep_to_meshes(rhino3dm, geo))
+        elif geo_type == "Extrusion":
+            meshes.extend(self._rhino_extrusion_to_meshes(rhino3dm, geo))
+        elif geo_type == "Surface":
+            try:
+                brep = rhino3dm.Brep.CreateFromSurface(geo)
+                if brep:
+                    meshes.extend(self._rhino_brep_to_meshes(rhino3dm, brep))
+            except Exception:
+                pass
+        elif geo_type == "SubD" and hasattr(rhino3dm.Mesh, "CreateFromSubDControlNet"):
+            try:
+                mesh = rhino3dm.Mesh.CreateFromSubDControlNet(geo)
+                if mesh:
+                    meshes.append(mesh)
+            except Exception:
+                pass
+        elif hasattr(geo, "GetMesh"):
+            meshes.extend(self._meshes_from_get_mesh(rhino3dm, geo))
+
+        return [self._rhino_mesh_with_transform(mesh, transform) for mesh in meshes if mesh]
+
+    def _rhino_brep_to_meshes(self, rhino3dm, brep):
+        meshes = []
+        faces = getattr(brep, "Faces", None)
+        if faces is not None:
+            for face in faces:
+                meshes.extend(self._meshes_from_get_mesh(rhino3dm, face))
+        if not meshes:
+            meshes.extend(self._meshes_from_create_from_brep(rhino3dm, brep))
+        return meshes
+
+    def _rhino_extrusion_to_meshes(self, rhino3dm, extrusion):
+        meshes = self._meshes_from_get_mesh(rhino3dm, extrusion)
+        if meshes:
+            return meshes
+        try:
+            brep = extrusion.ToBrep()
+            if brep:
+                return self._rhino_brep_to_meshes(rhino3dm, brep)
+        except Exception:
+            pass
+        return []
+
+    def _meshes_from_get_mesh(self, rhino3dm, geo):
+        meshes = []
+        getter = getattr(geo, "GetMesh", None)
+        if not callable(getter):
+            return meshes
+        for mesh_type in (
+            rhino3dm.MeshType.Render,
+            rhino3dm.MeshType.Default,
+            rhino3dm.MeshType.Preview,
+            rhino3dm.MeshType.Any,
+        ):
+            try:
+                mesh = getter(mesh_type)
+            except Exception:
+                continue
+            if (
+                mesh
+                and self._rhino_collection_count(mesh.Vertices) > 0
+                and self._rhino_collection_count(mesh.Faces) > 0
+            ):
+                meshes.append(mesh)
+                break
+        return meshes
+
+    def _meshes_from_create_from_brep(self, rhino3dm, brep):
+        creator = getattr(rhino3dm.Mesh, "CreateFromBrep", None)
+        if not callable(creator):
+            return []
+        try:
+            meshes = creator(brep)
+        except Exception:
+            return []
+        if not meshes:
+            return []
+        return [
+            mesh
+            for mesh in meshes
+            if mesh
+            and self._rhino_collection_count(mesh.Vertices) > 0
+            and self._rhino_collection_count(mesh.Faces) > 0
+        ]
+
+    def _rhino_mesh_with_transform(self, mesh, transform):
+        if transform is None:
+            return mesh
+        try:
+            mesh = mesh.Duplicate()
+            mesh.Transform(transform)
+        except Exception:
+            pass
+        return mesh
+
+    def _compose_rhino_transform(self, rhino3dm, parent, child):
+        if parent is None:
+            return child
+        if child is None:
+            return parent
+        try:
+            return rhino3dm.Transform.Multiply(parent, child)
+        except Exception:
+            return child
+
+    def _rhino_object_index(self, obj, fallback):
+        object_id = getattr(obj.Attributes, "Id", None)
+        if not object_id:
+            return fallback
+        return self._object_index_by_id.get(str(object_id), fallback)
+
+    def _rhino_object_material(self, rhino3dm, model, attr):
+        if attr.MaterialSource == rhino3dm.ObjectMaterialSource.MaterialFromObject:
+            return self._rhino_material_at(model, getattr(attr, "MaterialIndex", -1))
+        if attr.MaterialSource == rhino3dm.ObjectMaterialSource.MaterialFromLayer:
+            layer = self._rhino_layer_at(model, getattr(attr, "LayerIndex", -1))
+            material_index = getattr(layer, "RenderMaterialIndex", -1) if layer else -1
+            return self._rhino_material_at(model, material_index)
+        return None
+
+    def _rhino_object_color(
+        self, rhino3dm, model, attr, material, object_index, fallback_colors
+    ):
+        if attr.ColorSource == rhino3dm.ObjectColorSource.ColorFromObject:
+            color = self._rhino_color_tuple(getattr(attr, "ObjectColor", None))
+            if color:
+                return color
+        if material:
+            material_color = self._rhino_material_diffuse_color(material)
+            if material_color:
+                return material_color
+        if attr.ColorSource == rhino3dm.ObjectColorSource.ColorFromLayer:
+            layer = self._rhino_layer_at(model, getattr(attr, "LayerIndex", -1))
+            layer_color = self._rhino_color_tuple(getattr(layer, "Color", None))
+            if layer_color:
+                return layer_color
+        return fallback_colors[object_index % len(fallback_colors)]
+
+    def _rhino_material_at(self, model, material_index):
+        try:
+            material_index = int(material_index)
+        except (TypeError, ValueError):
+            return None
+        if material_index < 0 or material_index >= len(model.Materials):
+            return None
+        try:
+            return model.Materials[material_index]
+        except Exception:
+            return None
+
+    def _rhino_layer_at(self, model, layer_index):
+        try:
+            layer_index = int(layer_index)
+        except (TypeError, ValueError):
+            return None
+        if layer_index < 0 or layer_index >= len(model.Layers):
+            return None
+        try:
+            return model.Layers[layer_index]
+        except Exception:
+            return None
+
+    def _rhino_material_diffuse_color(self, material):
+        try:
+            return self._rhino_color_tuple(material.DiffuseColor)
+        except Exception:
+            return None
+
+    def _rhino_color_tuple(self, color):
+        if color is None:
+            return None
+        if isinstance(color, tuple) and len(color) >= 3:
+            r, g, b = color[:3]
+        else:
+            try:
+                r, g, b = color.R, color.G, color.B
+            except AttributeError:
+                return None
+        return self._clamp_color_channel(r), self._clamp_color_channel(g), self._clamp_color_channel(b)
+
+    def _clamp_color_channel(self, value):
+        value = float(value)
+        if value > 1.0:
+            value /= 255.0
+        return max(0.0, min(1.0, value))
+
+    def _rhino_material_texture(self, material):
+        if material is None:
+            return None
+        texture_path = self._rhino_material_texture_path(material)
+        if not texture_path:
+            return None
+        reader = self._texture_reader_for_path(texture_path)
+        if reader is None:
+            return None
+        try:
+            reader.SetFileName(texture_path)
+            reader.Update()
+            texture = vtk.vtkTexture()
+            texture.SetInputConnection(reader.GetOutputPort())
+            texture.InterpolateOn()
+            return texture
+        except Exception:
+            return None
+
+    def _rhino_material_texture_path(self, material):
+        for getter_name in ("GetBitmapTexture", "GetTexture"):
+            getter = getattr(material, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                texture_info = getter()
+            except TypeError:
+                continue
+            path = self._rhino_texture_filename(texture_info)
+            if path:
+                return path
+        return ""
+
+    def _rhino_texture_filename(self, texture_info):
+        if texture_info is None:
+            return ""
+        for attr_name in ("FileName", "Filename", "Path"):
+            filename = getattr(texture_info, attr_name, "")
+            if filename:
+                return self._resolve_texture_path(str(filename))
+        return ""
+
+    def _resolve_texture_path(self, filename):
+        filename = filename.strip().strip('"')
+        if not filename:
+            return ""
+        candidates = []
+        if os.path.isabs(filename):
+            candidates.append(filename)
+        else:
+            candidates.append(os.path.join(self._current_model_dir, filename))
+            candidates.append(os.path.join(self._current_model_dir, os.path.basename(filename)))
+        for candidate in candidates:
+            candidate = os.path.normpath(candidate)
+            if os.path.exists(candidate):
+                return candidate
+        return ""
+
+    def _texture_reader_for_path(self, texture_path):
+        ext = os.path.splitext(texture_path)[1].lower()
+        if ext in (".jpg", ".jpeg"):
+            return vtk.vtkJPEGReader()
+        if ext == ".png":
+            return vtk.vtkPNGReader()
+        if ext == ".bmp":
+            return vtk.vtkBMPReader()
+        if ext in (".tif", ".tiff"):
+            return vtk.vtkTIFFReader()
+        return None
+
+    def _rhino_collection_count(self, collection):
+        try:
+            count = getattr(collection, "Count", None)
+        except AttributeError:
+            count = None
+        if count is not None:
+            try:
+                return int(count() if callable(count) else count)
+            except (TypeError, ValueError, AttributeError):
+                pass
+        try:
+            return len(collection)
+        except (TypeError, AttributeError):
+            return sum(1 for _ in collection)
 
     def _rhino_mesh_to_vtk(self, mesh, name="mesh"):
         """将 Rhino 网格转换为 VTK Actor"""
         vertices = mesh.Vertices
         faces = mesh.Faces
 
-        if vertices.Count == 0:
+        vertex_count = self._rhino_collection_count(vertices)
+        face_count = self._rhino_collection_count(faces)
+        if vertex_count == 0:
             return None
 
         # 创建VTK点集
         vtk_points = vtk.vtkPoints()
-        for i in range(vertices.Count):
+        for i in range(vertex_count):
             v = vertices[i]
-            vtk_points.InsertNextPoint(v.X, v.Y, v.Z)
+            vtk_points.InsertNextPoint(v.X, v.Z, -v.Y)
 
         # 创建VTK多边形
         vtk_cells = vtk.vtkCellArray()
-        for i in range(faces.Count):
+        for i in range(face_count):
             face_verts = faces[i]
-            if len(face_verts) == 4:
+            is_tri = len(face_verts) == 3 or (
+                len(face_verts) == 4 and face_verts[2] == face_verts[3]
+            )
+            if len(face_verts) == 4 and not is_tri:
                 # 四边面 -> 两个三角面
                 tri1 = vtk.vtkTriangle()
                 tri1.GetPointIds().SetId(0, face_verts[0])
@@ -167,7 +529,7 @@ class ModelLoadThread(QThread):
                 tri2.GetPointIds().SetId(1, face_verts[2])
                 tri2.GetPointIds().SetId(2, face_verts[3])
                 vtk_cells.InsertNextCell(tri2)
-            elif len(face_verts) == 3:
+            elif is_tri:
                 tri = vtk.vtkTriangle()
                 tri.GetPointIds().SetId(0, face_verts[0])
                 tri.GetPointIds().SetId(1, face_verts[1])
@@ -383,12 +745,14 @@ class ModelLoadThread(QThread):
         if hasattr(mapper, "SetStatic"):
             mapper.SetStatic(True)
 
-    def _configure_actor_material(self, actor, color):
+    def _configure_actor_material(self, actor, color, texture=None):
         prop = actor.GetProperty()
         prop.SetColor(*color)
         prop.SetSpecular(0.08)
         prop.SetSpecularPower(12)
         prop.SetInterpolationToGouraud()
+        if texture is not None:
+            actor.SetTexture(texture)
 
     def _has_vertex_color(self, poly):
         if poly is None:

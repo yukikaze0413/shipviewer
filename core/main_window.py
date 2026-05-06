@@ -34,27 +34,12 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QStackedWidget,
     QGroupBox,
-    QPushButton,
     QAbstractItemView,
     QScrollArea,
     QFrame,
 )
-from PySide6.QtCore import Qt, QSize, QTimer, QUrl
-from PySide6.QtGui import QAction, QKeySequence, QDesktopServices, QPixmap, QFont
-
-try:
-    from PySide6.QtWebEngineCore import QWebEngineSettings
-    from PySide6.QtWebEngineWidgets import QWebEngineView
-except ImportError:
-    QWebEngineSettings = None
-    QWebEngineView = None
-
-try:
-    from PySide6.QtPdf import QPdfDocument
-    from PySide6.QtPdfWidgets import QPdfView
-except ImportError:
-    QPdfDocument = None
-    QPdfView = None
+from PySide6.QtCore import Qt, QSize, QTimer
+from PySide6.QtGui import QAction, QKeySequence, QPixmap, QFont
 
 from core.vtk_widget import VTKWidget
 from core.model_loader import ModelLoadThread, get_supported_formats
@@ -86,13 +71,13 @@ class MainWindow(QMainWindow):
             ("assets", "csv", "damage-tree-nodes.csv"),
             "damage-tree-nodes.csv",
         )
-        self._pdf_catalog_csv_path = self._resolve_data_file(
-            ("assets", "csv", "part-pdf-catalog.csv"),
-            "part-pdf-catalog.csv",
-        )
         self._device_catalog_json_path = self._resolve_data_file(
             ("assets", "json", "device-catalog.json"),
             "device-catalog.json",
+        )
+        self._damage_camera_poses_path = self._resolve_data_file(
+            ("assets", "json", "damage-camera-poses.json"),
+            "damage-camera-poses.json",
         )
         self._viewport_background_path = self._resolve_background_hdr_path()
         self._water_texture_path = self._resolve_data_file(
@@ -102,17 +87,14 @@ class MainWindow(QMainWindow):
             ("assets", "water", "water.jpg"),
             ("assets", "water", "water.png"),
         )
-        self._pdf_catalog_rows = []
-        self._pdf_catalog_by_model_name = defaultdict(list)
-        self._pdf_catalog_by_damage_leaf_id = defaultdict(list)
         self._device_catalog_rows = []
         self._device_catalog_by_model_name = defaultdict(list)
         self._device_catalog_by_damage_leaf_id = defaultdict(list)
         self._damage_nodes_by_id = {}
         self._damage_children_by_id = defaultdict(list)
         self._damage_node_ids = set()
+        self._damage_camera_poses_by_id = {}
         self._current_catalog_matches = []
-        self._current_document_path = None
         self._actor_catalog_names = {}
         self._actor_display_names = {}
 
@@ -123,9 +105,9 @@ class MainWindow(QMainWindow):
         self._create_model_tree_dock()
         self._create_properties_dock()
         self._create_status_bar()
-        self._load_pdf_catalog_from_csv()
         self._load_device_catalog_from_json()
         self._load_damage_tree_from_csv()
+        self._load_damage_camera_poses()
 
         # 信号连接
         self.vtk_widget.model_clicked.connect(self._on_vtk_model_clicked)
@@ -435,9 +417,6 @@ class MainWindow(QMainWindow):
 
         self.document_status_label = QLabel("未选择设备")
         self.document_status_label.setWordWrap(True)
-        self.open_document_button = QPushButton("打开文档")
-        self.open_document_button.setEnabled(False)
-        self.open_document_button.clicked.connect(self._open_current_document)
 
         self.document_view = QStackedWidget()
         self.document_view.setMinimumWidth(0)
@@ -447,9 +426,6 @@ class MainWindow(QMainWindow):
         self.document_message_view.setWordWrap(True)
         self.document_view.addWidget(self.document_message_view)
 
-        self.pdf_document = None
-        self.pdf_view = None
-        self.web_document_view = None
         self._create_device_detail_view()
 
         self.document_view.setMinimumHeight(260)
@@ -493,9 +469,9 @@ class MainWindow(QMainWindow):
         )
 
     def _reload_damage_tree(self):
-        self._load_pdf_catalog_from_csv()
         self._load_device_catalog_from_json()
         self._load_damage_tree_from_csv()
+        self._load_damage_camera_poses()
 
     def _create_device_detail_view(self):
         detail_scroll = QScrollArea()
@@ -545,94 +521,6 @@ class MainWindow(QMainWindow):
         detail_scroll.setWidget(detail_widget)
         self.device_detail_view = detail_scroll
         self.document_view.addWidget(self.device_detail_view)
-
-    def _configure_document_view(self, document_view):
-        if QWebEngineSettings is None:
-            return
-
-        settings = document_view.settings()
-        web_attribute = getattr(QWebEngineSettings, "WebAttribute", QWebEngineSettings)
-        for setting_name in (
-            "PdfViewerEnabled",
-            "LocalContentCanAccessFileUrls",
-            "LocalContentCanAccessRemoteUrls",
-        ):
-            attr = getattr(web_attribute, setting_name, None)
-            if attr is None:
-                attr = getattr(QWebEngineSettings, setting_name, None)
-            if attr is not None:
-                settings.setAttribute(attr, True)
-
-    def _load_pdf_catalog_from_csv(self, csv_path=None):
-        csv_path = csv_path or self._pdf_catalog_csv_path
-        self._pdf_catalog_rows = []
-        self._pdf_catalog_by_model_name.clear()
-        self._pdf_catalog_by_damage_leaf_id.clear()
-
-        if not os.path.exists(csv_path):
-            self._set_document_message(
-                f"未找到文档目录文件: {os.path.basename(csv_path)}"
-            )
-            return
-
-        try:
-            rows = self._read_pdf_catalog_rows(csv_path)
-        except Exception as exc:
-            self._set_document_message(f"读取文档目录失败: {exc}")
-            return
-
-        self._pdf_catalog_rows = rows
-        for row in rows:
-            model_name = row["model_name"]
-            damage_leaf_id = self._normalize_damage_id(row["damage_leaf_id"])
-            if model_name:
-                self._pdf_catalog_by_model_name[model_name].append(row)
-            if damage_leaf_id:
-                self._pdf_catalog_by_damage_leaf_id[damage_leaf_id].append(row)
-
-        if not rows:
-            self._set_document_message("文档目录为空。")
-
-    def _read_pdf_catalog_rows(self, csv_path):
-        last_error = None
-        for encoding in ("utf-8-sig", "utf-8", "gb18030"):
-            try:
-                with open(csv_path, "r", encoding=encoding, newline="") as f:
-                    reader = csv.reader(f)
-                    next(reader, None)  # header
-                    rows = []
-                    for idx, row in enumerate(reader, start=2):
-                        if not row or not any(col.strip() for col in row):
-                            continue
-
-                        cols = list(row) + [""] * (4 - len(row))
-                        model_name = cols[0].strip()
-                        display_name = cols[1].strip()
-                        document_path = cols[2].strip()
-                        damage_leaf_id = cols[3].strip()
-                        if not any(
-                            (model_name, display_name, document_path, damage_leaf_id)
-                        ):
-                            continue
-                        rows.append(
-                            {
-                                "model_name": model_name,
-                                "display_name": display_name
-                                or model_name
-                                or damage_leaf_id,
-                                "document_path": document_path,
-                                "damage_leaf_id": damage_leaf_id,
-                                "row_number": idx,
-                            }
-                        )
-                    return rows
-            except UnicodeDecodeError as exc:
-                last_error = exc
-                continue
-
-        if last_error:
-            raise last_error
-        return []
 
     def _load_device_catalog_from_json(self, json_path=None):
         json_path = json_path or self._device_catalog_json_path
@@ -693,39 +581,6 @@ class MainWindow(QMainWindow):
                 }
             )
         return rows
-
-    def _resolve_document_path(self, document_path):
-        raw_path = (document_path or "").strip().strip('"')
-        if not raw_path:
-            return ""
-
-        if re.match(r"^[A-Za-z]:[\\/]", raw_path):
-            return os.path.normpath(raw_path)
-
-        if raw_path.startswith(("/", "\\")):
-            raw_path = raw_path.lstrip("/\\")
-
-        if os.path.isabs(raw_path):
-            return os.path.normpath(raw_path)
-
-        candidates = []
-        if not os.path.dirname(raw_path):
-            candidates.append(os.path.join(self._assets_root, "pdfs", raw_path))
-
-        candidates.append(os.path.join(self._project_root, raw_path))
-        candidates.append(
-            os.path.join(self._assets_root, "pdfs", os.path.basename(raw_path))
-        )
-        candidates.append(
-            os.path.join(self._project_root, "pdfs", os.path.basename(raw_path))
-        )
-
-        for candidate in candidates:
-            candidate = os.path.normpath(candidate)
-            if os.path.exists(candidate):
-                return candidate
-
-        return os.path.normpath(candidates[0] if candidates else raw_path)
 
     def _resolve_device_image_path(self, image_path):
         raw_path = (image_path or "").strip().strip('"')
@@ -828,6 +683,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.status_label.setText(f"读取损伤相机配置失败: {exc}")
             return
+
+        camera_max_distance = self._numeric_float(data.get("camera_max_distance"))
+        if camera_max_distance and camera_max_distance > 0:
+            self.vtk_widget.set_camera_max_distance(camera_max_distance)
 
         for pose in data.get("poses") or []:
             node_id = self._normalize_damage_id(pose.get("node_id"))
@@ -1532,6 +1391,7 @@ class MainWindow(QMainWindow):
             self.vtk_widget.add_actor(actor, actor_name)
             self._actor_catalog_names[actor_name] = self._best_catalog_name(
                 item_data.get("name"),
+                item_data.get("base_name") if item_data.get("is_split") else None,
             )
             self._actor_display_names[actor_name] = self._original_display_name(
                 item_data.get("name"),
@@ -1620,7 +1480,7 @@ class MainWindow(QMainWindow):
         meta_parts = [f"选择名称: {display_name}"]
         if info:
             meta_parts.extend(f"{key}: {value}" for key, value in info.items())
-        matches = self._pdf_catalog_by_model_name.get(catalog_key, [])
+        matches = self._device_catalog_by_model_name.get(catalog_key, [])
         if catalog_key != display_name:
             meta_parts.append(f"匹配模型名称: {catalog_key}")
         self._show_catalog_matches(
@@ -1651,6 +1511,7 @@ class MainWindow(QMainWindow):
             highlighted_names = self._selection_names_for_catalog_rows(object_matches)
             self.vtk_widget.highlight_actors(highlighted_names)
             self.vtk_widget.focus_selection(highlighted_names)
+            self._apply_damage_camera_pose(node_id)
             self._set_highlight_debug(self.vtk_widget.highlighted_names())
 
             highlight_text = (
@@ -1690,9 +1551,61 @@ class MainWindow(QMainWindow):
                 source_type="model",
                 source_key=catalog_key,
                 display_name=f"模型对象: {display_name}",
-                matches=self._pdf_catalog_by_model_name.get(catalog_key, []),
+                matches=self._device_catalog_by_model_name.get(catalog_key, []),
                 meta="  |  ".join(meta_parts),
             )
+
+    def _apply_damage_camera_pose(self, node_id):
+        pose = self._damage_camera_pose_for_node(node_id)
+        if not pose:
+            return False
+
+        focal_point = self._numeric_tuple(pose.get("focal_point"))
+        position = self._numeric_tuple(pose.get("position"))
+        direction = self._numeric_tuple(pose.get("direction"))
+        view_up = self._numeric_tuple(pose.get("view_up")) or (0.0, 1.0, 0.0)
+        distance = self._numeric_float(pose.get("distance"))
+        clipping_bounds = self.vtk_widget.get_scene_model_bounds()
+        return self.vtk_widget.set_camera_pose(
+            focal_point=focal_point,
+            position=position,
+            direction=direction,
+            distance=distance,
+            view_up=view_up,
+            clipping_bounds=clipping_bounds,
+        )
+
+    def _damage_camera_pose_for_node(self, node_id):
+        normalized_node_id = self._normalize_damage_id(node_id)
+        if not normalized_node_id:
+            return None
+
+        pose = self._damage_camera_poses_by_id.get(normalized_node_id)
+        if pose:
+            return pose
+
+        node = self._damage_nodes_by_id.get(normalized_node_id)
+        parent_id = self._normalize_damage_id(node.get("parent_id", "")) if node else ""
+        while parent_id:
+            pose = self._damage_camera_poses_by_id.get(parent_id)
+            if pose:
+                return pose
+            parent = self._damage_nodes_by_id.get(parent_id)
+            parent_id = (
+                self._normalize_damage_id(parent.get("parent_id", "")) if parent else ""
+            )
+        return None
+
+    def _numeric_tuple(self, vector, size=3):
+        if not self._is_numeric_vector(vector, size=size):
+            return None
+        return tuple(float(value) for value in vector)
+
+    def _numeric_float(self, value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _descendant_leaf_node_ids(self, item):
         if item.childCount() == 0:
@@ -1708,7 +1621,7 @@ class MainWindow(QMainWindow):
         normalized_node_id = self._normalize_damage_id(node_id)
         return [
             row
-            for row in self._pdf_catalog_rows
+            for row in self._device_catalog_rows
             if self._normalize_damage_id(row.get("model_name", "")) == normalized_node_id
             if self._is_damage_node_catalog_row(row)
         ]
@@ -1717,7 +1630,7 @@ class MainWindow(QMainWindow):
         rows = []
         for damage_id in damage_ids:
             normalized_damage_id = self._normalize_damage_id(damage_id)
-            for row in self._pdf_catalog_by_damage_leaf_id.get(normalized_damage_id, []):
+            for row in self._device_catalog_by_damage_leaf_id.get(normalized_damage_id, []):
                 if self._is_damage_node_catalog_row(row):
                     continue
                 rows.append(row)
@@ -1767,7 +1680,6 @@ class MainWindow(QMainWindow):
             key = (
                 row.get("model_name"),
                 row.get("damage_leaf_id"),
-                row.get("document_path"),
             )
             if key in seen:
                 continue
@@ -1780,7 +1692,6 @@ class MainWindow(QMainWindow):
             return []
 
         matches = []
-        fuzzy_matches = []
         lookup_key = self._normalize_catalog_match_text(catalog_key)
         for selection_name in self._actor_catalog_names:
             actor_key = self._catalog_key_for_actor(selection_name)
@@ -1796,25 +1707,25 @@ class MainWindow(QMainWindow):
             )
             if any(
                 lookup_key
-                and lookup_key in self._normalize_catalog_match_text(candidate)
+                and lookup_key == self._normalize_catalog_match_text(candidate)
                 for candidate in candidate_texts
             ):
-                fuzzy_matches.append(selection_name)
-        matches.extend(
-            selection_name
-            for selection_name in fuzzy_matches
-            if selection_name not in matches
-        )
+                matches.append(selection_name)
         return matches
 
     def _normalize_catalog_match_text(self, text):
-        return str(text or "").strip().casefold()
+        return unicodedata.normalize("NFKC", str(text or "")).strip().casefold()
 
     def _original_display_name(self, name, fallback):
         name = str(name or "").strip()
         return name or fallback
 
     def _display_name_for_actor(self, actor_name):
+        catalog_key = self._catalog_key_for_actor(actor_name)
+        for row in self._device_catalog_by_model_name.get(catalog_key, []):
+            display_name = row.get("display_name")
+            if display_name:
+                return display_name
         return self._actor_display_names.get(actor_name) or actor_name
 
     def _best_catalog_name(self, *candidates):
@@ -1825,7 +1736,7 @@ class MainWindow(QMainWindow):
             candidate = str(candidate).strip()
             if not fallback:
                 fallback = candidate
-            if candidate in self._pdf_catalog_by_model_name:
+            if candidate in self._device_catalog_by_model_name:
                 return candidate
         return fallback
 
@@ -1834,7 +1745,7 @@ class MainWindow(QMainWindow):
             return ""
 
         mapped_name = self._actor_catalog_names.get(actor_name)
-        if mapped_name and mapped_name in self._pdf_catalog_by_model_name:
+        if mapped_name and mapped_name in self._device_catalog_by_model_name:
             return mapped_name
 
         return mapped_name or actor_name
@@ -1933,8 +1844,6 @@ class MainWindow(QMainWindow):
             or device_row.get("damage_leaf_id")
             or fallback_title
         )
-        self._current_document_path = None
-        self.open_document_button.setEnabled(False)
         self.device_title_label.setText(title or "未命名设备")
 
         for field_key in ("material", "thickness", "size", "function"):
@@ -1972,48 +1881,7 @@ class MainWindow(QMainWindow):
         self.device_image_label.setText("")
         self.device_image_label.setPixmap(scaled)
 
-    def _load_document_preview(self, resolved_path, title):
-        filename = os.path.basename(resolved_path)
-        ext = os.path.splitext(resolved_path)[1].lower()
-
-        if ext == ".pdf":
-            if self.pdf_document is None or self.pdf_view is None:
-                self._show_document_message(
-                    f"已匹配 PDF，但当前 PySide6 环境未启用 QtPdf。\n{resolved_path}"
-                )
-                self.document_status_label.setText(f"无法预览: {title} ({filename})")
-                return
-
-            self.pdf_document.close()
-            error = self.pdf_document.load(resolved_path)
-            if error != QPdfDocument.Error.None_:
-                self._show_document_message(
-                    f"PDF 加载失败: {error.name}\n{resolved_path}"
-                )
-                self.document_status_label.setText(
-                    f"PDF 加载失败: {title} ({filename})"
-                )
-                return
-
-            self.document_view.setCurrentWidget(self.pdf_view)
-            self.document_status_label.setText(f"正在显示: {title} ({filename})")
-            return
-
-        if self.web_document_view is None:
-            self._show_document_message(
-                f"已匹配文档，但当前 PySide6 环境未启用 QtWebEngine。\n{resolved_path}"
-            )
-            self.document_status_label.setText(f"无法预览: {title} ({filename})")
-            return
-
-        self.web_document_view.load(QUrl.fromLocalFile(resolved_path))
-        self.document_view.setCurrentWidget(self.web_document_view)
-        self.document_status_label.setText(f"正在显示: {title} ({filename})")
-
     def _set_document_message(self, message):
-        self._current_document_path = None
-        if hasattr(self, "open_document_button"):
-            self.open_document_button.setEnabled(False)
         if hasattr(self, "document_status_label"):
             self.document_status_label.setText(message)
         if not hasattr(self, "document_message_view"):
@@ -2024,11 +1892,6 @@ class MainWindow(QMainWindow):
     def _show_document_message(self, message):
         self.document_message_view.setText(message)
         self.document_view.setCurrentWidget(self.document_message_view)
-
-    def _open_current_document(self):
-        if not self._current_document_path:
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(self._current_document_path))
 
     def clear_scene(self):
         """清空场景"""

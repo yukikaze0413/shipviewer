@@ -187,6 +187,7 @@ class VTKWidget(QWidget):
         self._focus_selected_base_names = set()
         self._camera_debug_annotation = None
         self._camera_debug_overlay_visible = False
+        self._camera_max_distance = float(self.CAMERA_MAX_DISTANCE)
         self._setup_ui()
         self._setup_vtk()
 
@@ -411,6 +412,22 @@ class VTKWidget(QWidget):
             visible = not self._camera_debug_overlay_visible
         self.set_camera_debug_overlay_visible(visible)
 
+    def camera_max_distance(self):
+        return self._camera_max_distance
+
+    def set_camera_max_distance(self, distance):
+        distance = float(distance)
+        if distance <= 0:
+            return False
+
+        self._camera_max_distance = distance
+        camera = self.renderer.GetActiveCamera()
+        if camera is not None:
+            self._clamp_camera_distance(camera)
+            self.renderer.ResetCameraClippingRange()
+            self.render_window.Render()
+        return True
+
     def _add_axes_widget(self):
         axes = vtk.vtkAxesActor()
         axes.SetTotalLength(1.0, 1.0, 1.0)
@@ -618,8 +635,8 @@ class VTKWidget(QWidget):
         )
 
     def _clamp_camera_distance(self, camera):
-        if camera.GetDistance() > self.CAMERA_MAX_DISTANCE:
-            self._set_camera_distance(camera, self.CAMERA_MAX_DISTANCE)
+        if camera.GetDistance() > self._camera_max_distance:
+            self._set_camera_distance(camera, self._camera_max_distance)
 
     def _zoom_parallel_camera(self, camera, direction, zoom_factor):
         scale = camera.GetParallelScale()
@@ -1013,6 +1030,58 @@ class VTKWidget(QWidget):
     def set_view_iso(self):
         self.reset_camera()
 
+    def set_camera_pose(
+        self,
+        focal_point,
+        position=None,
+        direction=None,
+        distance=None,
+        view_up=(0.0, 1.0, 0.0),
+        clipping_bounds=None,
+    ):
+        if focal_point is None:
+            return False
+
+        camera = self.renderer.GetActiveCamera()
+        if camera is None:
+            return False
+
+        focal_point = tuple(float(value) for value in focal_point)
+        position = tuple(float(value) for value in position) if position else None
+        direction = tuple(float(value) for value in direction) if direction else None
+        view_up = tuple(float(value) for value in (view_up or (0.0, 1.0, 0.0)))
+
+        use_direction = position is None or self._points_are_close(position, focal_point)
+        if use_direction:
+            if direction is None:
+                return False
+            direction = self._normalize_vector(direction)
+            distance = (
+                float(distance)
+                if distance and distance > 0
+                else self._camera_max_distance
+            )
+            position = (
+                focal_point[0] + direction[0] * distance,
+                focal_point[1] + direction[1] * distance,
+                focal_point[2] + direction[2] * distance,
+            )
+
+        camera.SetViewAngle(self.CAMERA_VIEW_ANGLE_DEG)
+        camera.SetFocalPoint(*focal_point)
+        camera.SetPosition(*position)
+        camera.SetViewUp(*view_up)
+        camera.SetRoll(0.0)
+        if clipping_bounds is None:
+            self.renderer.ResetCameraClippingRange()
+        else:
+            self.renderer.ResetCameraClippingRange(clipping_bounds)
+        self.render_window.Render()
+        return True
+
+    def _points_are_close(self, point_a, point_b, epsilon=1e-6):
+        return all(abs(a - b) <= epsilon for a, b in zip(point_a, point_b))
+
     def _reset_camera_to_direction(self, direction, view_up, scene_bounds=None):
         bounds = scene_bounds if scene_bounds is not None else self._get_scene_model_bounds()
         if bounds is None:
@@ -1030,7 +1099,7 @@ class VTKWidget(QWidget):
         view_angle_rad = math.radians(self.CAMERA_VIEW_ANGLE_DEG)
         distance = min(
             max(radius * padding / math.sin(view_angle_rad / 2.0), 1.0),
-            self.CAMERA_MAX_DISTANCE,
+            self._camera_max_distance,
         )
 
         camera = self.renderer.GetActiveCamera()
