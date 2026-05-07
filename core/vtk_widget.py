@@ -3,18 +3,20 @@ VTK渲染窗口组件
 将VTK渲染器集成到PySide6 QWidget中
 """
 
+import ctypes
 import math
 import os
+import sys
+import time
+from collections import deque
 
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import (
     QVTKRenderWindowInteractor,
     _get_event_pos,
-    EventType,
-    MouseButton,
 )
 from PySide6.QtWidgets import QWidget, QVBoxLayout
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, QEvent, Qt, QTimer
 
 
 class YUpInteractorStyle(vtk.vtkInteractorStyleTerrain):
@@ -82,21 +84,21 @@ class RemappedQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
             self._wheel_delta_remainder += 120
 
     def mousePressEvent(self, ev):
-        repeat = 1 if ev.type() == EventType.MouseButtonDblClick else 0
+        repeat = 1 if ev.type() == QEvent.Type.MouseButtonDblClick else 0
         self._set_interactor_event_info(ev, repeat=repeat)
 
         self._ActiveButton = ev.button()
 
-        if self._ActiveButton == MouseButton.LeftButton:
+        if self._ActiveButton == Qt.MouseButton.LeftButton:
             self._dispatch_left_click_pick()
             ev.accept()
             return
 
-        if self._ActiveButton == MouseButton.RightButton:
+        if self._ActiveButton == Qt.MouseButton.RightButton:
             self._Iren.LeftButtonPressEvent()
             return
 
-        if self._ActiveButton == MouseButton.MiddleButton:
+        if self._ActiveButton == Qt.MouseButton.MiddleButton:
             self._Iren.MiddleButtonPressEvent()
             return
 
@@ -105,19 +107,19 @@ class RemappedQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
     def mouseReleaseEvent(self, ev):
         self._set_interactor_event_info(ev)
 
-        if self._ActiveButton == MouseButton.LeftButton:
-            self._ActiveButton = MouseButton.NoButton
+        if self._ActiveButton == Qt.MouseButton.LeftButton:
+            self._ActiveButton = Qt.MouseButton.NoButton
             ev.accept()
             return
 
-        if self._ActiveButton == MouseButton.RightButton:
+        if self._ActiveButton == Qt.MouseButton.RightButton:
             self._Iren.LeftButtonReleaseEvent()
-            self._ActiveButton = MouseButton.NoButton
+            self._ActiveButton = Qt.MouseButton.NoButton
             return
 
-        if self._ActiveButton == MouseButton.MiddleButton:
+        if self._ActiveButton == Qt.MouseButton.MiddleButton:
             self._Iren.MiddleButtonReleaseEvent()
-            self._ActiveButton = MouseButton.NoButton
+            self._ActiveButton = Qt.MouseButton.NoButton
             return
 
         super().mouseReleaseEvent(ev)
@@ -159,6 +161,7 @@ class VTKWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._actors = {}  # base_name -> vtkActor/vtkLODActor
+        self._actor_name_by_ptr = {}  # vtk object pointer -> base_name
         self._actor_geometry = {}  # name -> (points, cells)
         self._actor_base_color = {}  # base_name -> (r, g, b)
         self._selection_targets = (
@@ -183,10 +186,38 @@ class VTKWidget(QWidget):
         self._water_texture_reader = None
         self._dynamic_hidden_actor_names = set()
         self._dynamic_hide_active = False
+        self._dynamic_hide_enabled = True
+        self._invisible_actor_count = 0
         self._focus_dimmed_actor_state = {}
+        self._focus_dimmed_base_names = set()
         self._focus_selected_base_names = set()
         self._camera_debug_annotation = None
         self._camera_debug_overlay_visible = False
+        self._performance_annotation = None
+        self._performance_overlay_visible = False
+        self._last_render_timestamp = 0.0
+        self._frame_durations = deque(maxlen=200)
+        self._frame_duration_sum = 0.0
+        self._performance_snapshot = {}
+        self._performance_snapshot_time = 0.0
+        self._system_stats_cache = {}
+        self._system_stats_timer = QTimer(self)
+        self._system_stats_timer.setInterval(1500)
+        self._system_stats_timer.timeout.connect(self._refresh_system_stats_cache)
+        self._performance_overlay_update_interval = 2.0
+        self._performance_overlay_last_text_time = 0.0
+        self._current_fps = 0.0
+        self._avg_fps_200 = 0.0
+        self._frame_time_ms = 0.0
+        self._avg_frame_time_ms = 0.0
+        self._interaction_active = False
+        self._render_count = 0
+        self._scene_metadata = {
+            "file_path": "",
+            "file_format": "",
+            "file_size_bytes": 0,
+            "logical_object_count": 0,
+        }
         self._camera_max_distance = float(self.CAMERA_MAX_DISTANCE)
         self._setup_ui()
         self._setup_vtk()
@@ -224,17 +255,20 @@ class VTKWidget(QWidget):
         self.picker = vtk.vtkCellPicker()
         self.picker.SetTolerance(0.0005)
         self.interactor.AddObserver(
-            "StartInteractionEvent", self._on_start_interaction, 1.0
+            vtk.vtkCommand.StartInteractionEvent, self._on_start_interaction, 1.0
         )
         self.interactor.AddObserver(
-            "EndInteractionEvent", self._on_end_interaction, 1.0
+            vtk.vtkCommand.EndInteractionEvent, self._on_end_interaction, 1.0
         )
-        self.render_window.AddObserver("StartEvent", self._on_render_start, 1.0)
+        self.render_window.AddObserver(
+            vtk.vtkCommand.StartEvent, self._on_render_start, 1.0
+        )
 
         self._add_axes_widget()
         self._add_water_surface()
         self._setup_lighting()
         self._setup_camera_debug_overlay()
+        self._setup_performance_overlay()
 
     def set_background_image(self, filepath):
         if filepath.lower().endswith((".hdr", ".pic")):
@@ -258,6 +292,7 @@ class VTKWidget(QWidget):
         self.renderer.SetBackgroundTexture(texture)
         self.renderer.TexturedBackgroundOn()
         self.renderer.GradientBackgroundOff()
+        self._performance_snapshot_time = 0.0
         self.render_window.Render()
         return True
 
@@ -289,9 +324,14 @@ class VTKWidget(QWidget):
         self.renderer.AddActor(skybox)
         self.renderer.SetEnvironmentTexture(texture, False)
         self.renderer.UseImageBasedLightingOn()
-        self.renderer.UseSphericalHarmonicsOn()
+        use_spherical_harmonics = getattr(
+            self.renderer, "UseSphericalHarmonicsOn", None
+        )
+        if callable(use_spherical_harmonics):
+            use_spherical_harmonics()
         self.renderer.TexturedBackgroundOff()
         self.renderer.GradientBackgroundOff()
+        self._performance_snapshot_time = 0.0
         self.render_window.Render()
         return True
 
@@ -331,7 +371,9 @@ class VTKWidget(QWidget):
         self.renderer.AddViewProp(annotation)
 
     def _on_render_start(self, obj, event):
+        self._capture_render_timing()
         self._update_camera_debug_overlay()
+        self._update_performance_overlay()
 
     def _format_vector(self, vector):
         return f"({vector[0]:+.4f}, {vector[1]:+.4f}, {vector[2]:+.4f})"
@@ -411,6 +453,388 @@ class VTKWidget(QWidget):
         if visible is None:
             visible = not self._camera_debug_overlay_visible
         self.set_camera_debug_overlay_visible(visible)
+
+    def _setup_performance_overlay(self):
+        annotation = vtk.vtkCornerAnnotation()
+        annotation.SetText(vtk.vtkCornerAnnotation.UpperLeft, "")
+        annotation.SetMaximumFontSize(16)
+        annotation.SetLinearFontScaleFactor(2.0)
+        annotation.SetNonlinearFontScaleFactor(1.0)
+
+        text_prop = annotation.GetTextProperty()
+        text_prop.SetColor(0.90, 0.98, 0.92)
+        text_prop.SetBackgroundColor(0.05, 0.08, 0.06)
+        text_prop.SetBackgroundOpacity(0.78)
+        text_prop.FrameOn()
+        text_prop.SetFrameColor(0.18, 0.34, 0.22)
+        text_prop.SetFrameWidth(1)
+        text_prop.BoldOff()
+        text_prop.ShadowOff()
+
+        annotation.VisibilityOff()
+        self._performance_annotation = annotation
+        self.renderer.AddViewProp(annotation)
+
+    def _capture_render_timing(self):
+        now = time.perf_counter()
+        if self._last_render_timestamp > 0.0:
+            delta = now - self._last_render_timestamp
+            if delta > 0.0:
+                self._frame_time_ms = delta * 1000.0
+                self._current_fps = 1.0 / delta
+                if len(self._frame_durations) == self._frame_durations.maxlen:
+                    self._frame_duration_sum -= self._frame_durations[0]
+                self._frame_durations.append(delta)
+                self._frame_duration_sum += delta
+                frame_count = len(self._frame_durations)
+                if self._frame_duration_sum > 0.0 and frame_count > 0:
+                    self._avg_fps_200 = frame_count / self._frame_duration_sum
+                    self._avg_frame_time_ms = (
+                        self._frame_duration_sum * 1000.0 / frame_count
+                    )
+        self._last_render_timestamp = now
+        self._render_count += 1
+
+    def _performance_overlay_text(self, stats):
+        file_name = stats.get("file_name") or "No file"
+        return (
+            "Performance\n"
+            f"FPS: {stats['fps']:.1f}  |  Avg200 FPS: {stats['avg_fps_200']:.1f}  |  Frame: {stats['frame_time_ms']:.2f} ms  |  Avg200 Frame: {stats['avg_frame_time_ms']:.2f} ms\n"
+            f"File: {file_name}  |  Format: {stats['file_format_text']}  |  Size: {self._format_bytes(stats['file_size_bytes'])}\n"
+            f"Objects: {stats['logical_object_count']:,}  |  Render Actors: {stats['render_actor_count']:,}  |  Invisible: {stats['invisible_actor_count']:,}\n"
+            f"Vertices: {stats['point_count']:,}  |  Cells: {stats['cell_count']:,}  |  LOD: {stats['lod_actor_count']:,}\n"
+            f"Textured Actors: {stats['textured_actor_count']:,}  |  Textures: {stats['texture_count']:,}  |  Images: {stats['image_count']:,}\n"
+            f"Texture Pixels: {stats['texture_pixel_count'] / 1_000_000.0:.2f} MP  |  Max Texture: {stats['max_texture_size_text']}\n"
+            f"Texture Memory ~= {self._format_bytes(stats['texture_memory_bytes'])}  |  Geometry Memory ~= {self._format_bytes(stats['geometry_memory_bytes'])}\n"
+            f"Process Memory: WS {self._format_bytes(stats['process_working_set_bytes'])}  |  Private {self._format_bytes(stats['process_private_bytes'])}\n"
+            f"Interaction: {'Active' if stats['interaction_active'] else 'Idle'}  |  Background: {stats['background_mode']}  |  Water: {'On' if stats['water_visible'] else 'Off'}"
+        )
+
+    def _update_performance_overlay(self, force=False):
+        if (
+            not self._performance_overlay_visible
+            or self._performance_annotation is None
+        ):
+            return
+
+        now = time.perf_counter()
+        if (
+            not force
+            and self._performance_overlay_last_text_time > 0.0
+            and (now - self._performance_overlay_last_text_time)
+            < self._performance_overlay_update_interval
+        ):
+            return
+
+        stats = self.get_performance_stats(force=force)
+        self._performance_annotation.SetText(
+            vtk.vtkCornerAnnotation.UpperLeft,
+            self._performance_overlay_text(stats),
+        )
+        self._performance_overlay_last_text_time = now
+
+    def set_performance_overlay_visible(self, visible=True):
+        self._performance_overlay_visible = bool(visible)
+        if self._performance_annotation is None:
+            return
+
+        if self._performance_overlay_visible:
+            self._refresh_system_stats_cache()
+            self._system_stats_timer.start()
+            self._update_performance_overlay(force=True)
+            self._performance_annotation.VisibilityOn()
+        else:
+            self._system_stats_timer.stop()
+            self._performance_annotation.VisibilityOff()
+
+        self.render_window.Render()
+
+    def toggle_performance_overlay(self, visible=None):
+        if visible is None:
+            visible = not self._performance_overlay_visible
+        self.set_performance_overlay_visible(visible)
+
+    def _format_bytes(self, size_bytes):
+        size = float(size_bytes or 0)
+        if size <= 0.0:
+            return "0 B"
+        units = ("B", "KB", "MB", "GB", "TB")
+        unit_index = 0
+        while size >= 1024.0 and unit_index < len(units) - 1:
+            size /= 1024.0
+            unit_index += 1
+        return f"{size:.2f} {units[unit_index]}"
+
+    def _texture_object_id(self, vtk_obj):
+        return getattr(vtk_obj, "__this__", "") if vtk_obj is not None else ""
+
+    def _vtk_memory_size_bytes(self, vtk_obj):
+        if vtk_obj is None:
+            return 0
+        getter = getattr(vtk_obj, "GetActualMemorySize", None)
+        if not callable(getter):
+            return 0
+        try:
+            value = getter()
+            numeric_value = int(str(value)) if value is not None else 0
+            return max(0, numeric_value) * 1024
+        except Exception:
+            return 0
+
+    def _texture_image_stats(self, texture):
+        image = texture.GetInput() if texture is not None else None
+        if image is None:
+            return {
+                "image_id": "",
+                "width": 0,
+                "height": 0,
+                "depth": 0,
+                "pixel_count": 0,
+                "memory_bytes": 0,
+            }
+
+        dims = image.GetDimensions()
+        width = max(0, int(dims[0]))
+        height = max(0, int(dims[1]))
+        depth = max(1, int(dims[2]))
+        pixel_count = width * height * depth
+        memory_bytes = self._vtk_memory_size_bytes(image)
+        if memory_bytes <= 0:
+            scalar_components = max(1, int(image.GetNumberOfScalarComponents() or 1))
+            scalar_size = max(1, int(image.GetScalarSize() or 1))
+            memory_bytes = pixel_count * scalar_components * scalar_size
+
+        return {
+            "image_id": self._texture_object_id(image),
+            "width": width,
+            "height": height,
+            "depth": depth,
+            "pixel_count": pixel_count,
+            "memory_bytes": memory_bytes,
+        }
+
+    def _actor_textures(self, actor):
+        textures = []
+        seen = set()
+
+        def add_texture(texture):
+            texture_id = self._texture_object_id(texture)
+            if texture is None or texture_id in seen:
+                return
+            seen.add(texture_id)
+            textures.append(texture)
+
+        if actor is None:
+            return textures
+
+        add_texture(actor.GetTexture())
+        prop = actor.GetProperty()
+        if prop is None:
+            return textures
+
+        for getter_name in (
+            "GetBaseColorTexture",
+            "GetORMTexture",
+            "GetNormalTexture",
+            "GetEmissiveTexture",
+            "GetOcclusionTexture",
+            "GetMetallicTexture",
+            "GetRoughnessTexture",
+        ):
+            getter = getattr(prop, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                add_texture(getter())
+            except TypeError:
+                continue
+
+        return textures
+
+    def _process_memory_info(self):
+        if sys.platform.startswith("win"):
+
+            class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS_EX()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX)
+            process = ctypes.windll.kernel32.GetCurrentProcess()
+            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                process,
+                ctypes.byref(counters),
+                counters.cb,
+            )
+            if ok:
+                return {
+                    "working_set_bytes": int(counters.WorkingSetSize),
+                    "private_bytes": int(counters.PrivateUsage),
+                }
+
+        return {"working_set_bytes": 0, "private_bytes": 0}
+
+    def _build_performance_snapshot(self):
+        total_points = sum(points for points, _cells in self._actor_geometry.values())
+        total_cells = sum(cells for _points, cells in self._actor_geometry.values())
+        render_actor_count = len(self._actors)
+        lod_actor_count = sum(
+            1 for actor in self._actors.values() if actor.IsA("vtkLODActor")
+        )
+        textured_actor_count = 0
+        geometry_memory_bytes = 0
+        unique_textures = {}
+        unique_images = {}
+
+        for actor in self._actors.values():
+            if self._actor_has_any_texture(actor):
+                textured_actor_count += 1
+            mapper = actor.GetMapper()
+            data_obj = mapper.GetInputDataObject(0, 0) if mapper else None
+            geometry_memory_bytes += self._vtk_memory_size_bytes(data_obj)
+            for texture in self._actor_textures(actor):
+                texture_id = self._texture_object_id(texture)
+                if not texture_id or texture_id in unique_textures:
+                    continue
+                image_stats = self._texture_image_stats(texture)
+                unique_textures[texture_id] = image_stats
+                image_id = image_stats["image_id"]
+                if image_id and image_id not in unique_images:
+                    unique_images[image_id] = image_stats
+
+        for texture in (self._background_texture, self._water_texture):
+            texture_id = self._texture_object_id(texture)
+            if texture is None or not texture_id or texture_id in unique_textures:
+                continue
+            image_stats = self._texture_image_stats(texture)
+            unique_textures[texture_id] = image_stats
+            image_id = image_stats["image_id"]
+            if image_id and image_id not in unique_images:
+                unique_images[image_id] = image_stats
+
+        texture_memory_bytes = sum(
+            item["memory_bytes"] for item in unique_textures.values()
+        )
+        texture_pixel_count = sum(
+            item["pixel_count"] for item in unique_textures.values()
+        )
+        max_texture_width = max(
+            (item["width"] for item in unique_textures.values()),
+            default=0,
+        )
+        max_texture_height = max(
+            (item["height"] for item in unique_textures.values()),
+            default=0,
+        )
+        file_path = self._scene_metadata.get("file_path", "")
+        file_format = self._scene_metadata.get("file_format", "")
+        file_size_bytes = int(self._scene_metadata.get("file_size_bytes") or 0)
+        logical_object_count = int(
+            self._scene_metadata.get("logical_object_count") or 0
+        )
+
+        return {
+            "file_name": os.path.basename(file_path) if file_path else "",
+            "file_path": file_path,
+            "file_format_text": file_format.upper() if file_format else "-",
+            "file_size_bytes": file_size_bytes,
+            "logical_object_count": logical_object_count,
+            "render_actor_count": render_actor_count,
+            "lod_actor_count": lod_actor_count,
+            "point_count": total_points,
+            "cell_count": total_cells,
+            "textured_actor_count": textured_actor_count,
+            "texture_count": len(unique_textures),
+            "image_count": len(unique_images),
+            "texture_pixel_count": texture_pixel_count,
+            "texture_memory_bytes": texture_memory_bytes,
+            "geometry_memory_bytes": geometry_memory_bytes,
+            "max_texture_width": max_texture_width,
+            "max_texture_height": max_texture_height,
+            "max_texture_size_text": (
+                f"{max_texture_width}×{max_texture_height}"
+                if max_texture_width and max_texture_height
+                else "-"
+            ),
+        }
+
+    def _refresh_system_stats_cache(self):
+        process_memory = self._process_memory_info()
+        self._system_stats_cache = {
+            "process_working_set_bytes": process_memory["working_set_bytes"],
+            "process_private_bytes": process_memory["private_bytes"],
+            "background_mode": (
+                "HDR Environment"
+                if self._skybox_actor is not None
+                else (
+                    "2D Background"
+                    if self._background_texture is not None
+                    else "Solid Color"
+                )
+            ),
+            "water_visible": bool(
+                self._water_actor is not None and self._water_actor.GetVisibility()
+            ),
+        }
+
+    def rebuild_performance_stats(self):
+        self._performance_snapshot = self._build_performance_snapshot()
+        self._performance_snapshot_time = time.perf_counter()
+        self._performance_overlay_last_text_time = 0.0
+        self._refresh_system_stats_cache()
+
+    def set_dynamic_hide_enabled(self, enabled=True):
+        enabled = bool(enabled)
+        if self._dynamic_hide_enabled == enabled:
+            return
+
+        self._dynamic_hide_enabled = enabled
+        self._performance_overlay_last_text_time = 0.0
+        if enabled:
+            return
+
+        if self._dynamic_hidden_actor_names:
+            for name in list(self._dynamic_hidden_actor_names):
+                actor = self._actors.get(name)
+                if actor is not None:
+                    actor.SetVisibility(True)
+            self._dynamic_hidden_actor_names.clear()
+            self._dynamic_hide_active = False
+            self._invisible_actor_count = 0
+            self.render_window.Render()
+
+    def get_performance_stats(self, force=False):
+        if not self._performance_snapshot:
+            self.rebuild_performance_stats()
+        elif force and not self._system_stats_cache:
+            self._refresh_system_stats_cache()
+
+        stats = dict(self._performance_snapshot)
+        stats.update(self._system_stats_cache)
+        stats.update(
+            {
+                "fps": self._current_fps,
+                "avg_fps_200": self._avg_fps_200,
+                "frame_time_ms": self._frame_time_ms,
+                "avg_frame_time_ms": self._avg_frame_time_ms,
+                "interaction_active": self._interaction_active,
+                "selected_count": len(self._selected_actor_names),
+                "render_count": self._render_count,
+                "invisible_actor_count": self._invisible_actor_count,
+            }
+        )
+        return stats
 
     def camera_max_distance(self):
         return self._camera_max_distance
@@ -568,16 +992,22 @@ class VTKWidget(QWidget):
         return self._get_scene_model_bounds()
 
     def _set_water_texture(self, texture_path):
+        water_actor = self._water_actor
+        if water_actor is None:
+            return False
+
         if not texture_path or not os.path.exists(texture_path):
             self._water_texture = None
             self._water_texture_reader = None
-            self._water_actor.SetTexture(None)
+            water_actor.SetTexture(vtk.vtkTexture())
+            self._performance_snapshot_time = 0.0
             return False
 
         reader_factory = vtk.vtkImageReader2Factory()
         reader = reader_factory.CreateImageReader2(texture_path)
         if reader is None:
-            self._water_actor.SetTexture(None)
+            water_actor.SetTexture(vtk.vtkTexture())
+            self._performance_snapshot_time = 0.0
             return False
 
         reader.SetFileName(texture_path)
@@ -590,7 +1020,8 @@ class VTKWidget(QWidget):
 
         self._water_texture_reader = reader
         self._water_texture = texture
-        self._water_actor.SetTexture(texture)
+        water_actor.SetTexture(texture)
+        self._performance_snapshot_time = 0.0
         return True
 
     def _current_interactor_event_position(self):
@@ -604,9 +1035,10 @@ class VTKWidget(QWidget):
         self.picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
         actor = self.picker.GetActor()
         if actor:
-            for name, mapped_actor in self._actors.items():
-                if mapped_actor == actor:
-                    return self._selection_name_for_pick(name)
+            actor_ptr = getattr(actor, "__this__", "")
+            base_name = self._actor_name_by_ptr.get(actor_ptr, "")
+            if base_name:
+                return self._selection_name_for_pick(base_name)
         return ""
 
     def _emit_model_clicked(self, clicked_name):
@@ -695,7 +1127,8 @@ class VTKWidget(QWidget):
         return base_name
 
     def _on_start_interaction(self, obj, event):
-        if self._dynamic_hide_active:
+        self._interaction_active = True
+        if not self._dynamic_hide_enabled or self._dynamic_hide_active:
             return
         if len(self._actors) < self.DYNAMIC_HIDE_MIN_ACTOR_COUNT:
             return
@@ -719,9 +1152,12 @@ class VTKWidget(QWidget):
                 self._dynamic_hidden_actor_names.add(name)
 
         self._dynamic_hide_active = bool(self._dynamic_hidden_actor_names)
+        self._invisible_actor_count = len(self._dynamic_hidden_actor_names)
 
     def _on_end_interaction(self, obj, event):
+        self._interaction_active = False
         if not self._dynamic_hide_active:
+            self._invisible_actor_count = len(self._dynamic_hidden_actor_names)
             return
         for name in list(self._dynamic_hidden_actor_names):
             actor = self._actors.get(name)
@@ -729,6 +1165,7 @@ class VTKWidget(QWidget):
                 actor.SetVisibility(True)
         self._dynamic_hidden_actor_names.clear()
         self._dynamic_hide_active = False
+        self._invisible_actor_count = 0
         self.render_window.Render()
 
     def _should_temporarily_hide_actor(self, base_name, camera):
@@ -754,6 +1191,23 @@ class VTKWidget(QWidget):
 
     def initialize(self):
         self.interactor.Initialize()
+
+    def set_scene_metadata(self, file_path="", logical_object_count=0):
+        normalized_path = os.path.normpath(file_path) if file_path else ""
+        try:
+            file_size_bytes = os.path.getsize(normalized_path) if normalized_path else 0
+        except OSError:
+            file_size_bytes = 0
+
+        self._scene_metadata = {
+            "file_path": normalized_path,
+            "file_format": os.path.splitext(normalized_path)[1].lstrip(".").lower(),
+            "file_size_bytes": file_size_bytes,
+            "logical_object_count": max(0, int(logical_object_count or 0)),
+        }
+        self._invisible_actor_count = 0
+        self._performance_snapshot = {}
+        self._performance_snapshot_time = 0.0
 
     def _actor_has_any_texture(self, actor):
         if actor is None:
@@ -813,17 +1267,24 @@ class VTKWidget(QWidget):
             lod_actor.SetMapper(mapper)
             lod_actor.SetProperty(actor.GetProperty())
             lod_actor.SetNumberOfCloudPoints(12000)
-            lod_actor.AutomaticLODSelectionOn()
+            enable_auto_lod = getattr(lod_actor, "AutomaticLODSelectionOn", None)
+            if callable(enable_auto_lod):
+                enable_auto_lod()
             render_actor = lod_actor
 
         render_actor.GetProperty().BackfaceCullingOn()
         self._actors[name] = render_actor
+        actor_ptr = getattr(render_actor, "__this__", "")
+        if actor_ptr:
+            self._actor_name_by_ptr[actor_ptr] = name
         self._actor_geometry[name] = self._count_data_object_geometry(data_obj)
         self._actor_sphere[name] = self._compute_actor_bounding_sphere(render_actor)
         self._actor_base_color[name] = tuple(render_actor.GetProperty().GetColor())
         self._selection_targets[name] = (name, None)
         self._selection_geometry[name] = self._actor_geometry[name]
         self._selection_base_color[name] = self._actor_base_color[name]
+        self._performance_snapshot = {}
+        self._performance_snapshot_time = 0.0
         if add_to_renderer:
             self.renderer.AddActor(render_actor)
 
@@ -876,12 +1337,19 @@ class VTKWidget(QWidget):
                     if self._selected_actor_names
                     else None
                 )
-            self.renderer.RemoveActor(self._actors[name])
+            render_actor = self._actors[name]
+            actor_ptr = getattr(render_actor, "__this__", "")
+            if actor_ptr:
+                self._actor_name_by_ptr.pop(actor_ptr, None)
+            self.renderer.RemoveActor(render_actor)
             del self._actors[name]
             self._actor_geometry.pop(name, None)
             self._actor_sphere.pop(name, None)
             self._actor_base_color.pop(name, None)
             self._dynamic_hidden_actor_names.discard(name)
+            self._invisible_actor_count = len(self._dynamic_hidden_actor_names)
+            self._performance_snapshot = {}
+            self._performance_snapshot_time = 0.0
             self._remove_selection_entries_for_base(name)
 
     def clear_scene(self):
@@ -892,6 +1360,7 @@ class VTKWidget(QWidget):
         for actor in self._actors.values():
             self.renderer.RemoveActor(actor)
         self._actors.clear()
+        self._actor_name_by_ptr.clear()
         self._actor_geometry.clear()
         self._actor_sphere.clear()
         self._actor_base_color.clear()
@@ -902,11 +1371,15 @@ class VTKWidget(QWidget):
         self._base_to_dataset_alias.clear()
         self._dynamic_hidden_actor_names.clear()
         self._dynamic_hide_active = False
+        self._invisible_actor_count = 0
         self._focus_dimmed_actor_state.clear()
+        self._focus_dimmed_base_names.clear()
         self._focus_selected_base_names.clear()
         self._selected_actor_name = None
         self._selected_actor_names = []
         self._highlight_overlay_actors.clear()
+        self._performance_snapshot = {}
+        self._performance_snapshot_time = 0.0
         self.update_water_surface_to_scene(render=False)
 
     def highlight_actor(self, name):
@@ -977,24 +1450,43 @@ class VTKWidget(QWidget):
         }
 
     def _apply_selection_focus_dim(self, selected_bases):
-        self._restore_focus_dimmed_actors()
+        selected_bases = set(selected_bases)
+        current_dimmed = set(self._focus_dimmed_base_names)
+        target_dimmed = {
+            base_name
+            for base_name in self._actors.keys()
+            if base_name not in selected_bases
+        }
+
+        names_to_restore = current_dimmed - target_dimmed
+        names_to_dim = target_dimmed - current_dimmed
+
+        self._restore_focus_dimmed_actors(names_to_restore)
         self._focus_selected_base_names = set(selected_bases)
-        if not selected_bases:
+        if not names_to_dim:
             return
 
-        for base_name, actor in self._actors.items():
-            if base_name in selected_bases:
+        for base_name in names_to_dim:
+            actor = self._actors.get(base_name)
+            if actor is None:
                 continue
             prop = actor.GetProperty()
             self._focus_dimmed_actor_state[base_name] = prop.GetOpacity()
             prop.SetOpacity(self.FOCUS_DIM_OPACITY)
+            self._focus_dimmed_base_names.add(base_name)
 
-    def _restore_focus_dimmed_actors(self):
-        for base_name, opacity in list(self._focus_dimmed_actor_state.items()):
+    def _restore_focus_dimmed_actors(self, base_names=None):
+        restore_names = (
+            set(base_names)
+            if base_names is not None
+            else set(self._focus_dimmed_base_names)
+        )
+        for base_name in restore_names:
+            opacity = self._focus_dimmed_actor_state.pop(base_name, None)
             actor = self._actors.get(base_name)
-            if actor is not None:
+            if actor is not None and opacity is not None:
                 actor.GetProperty().SetOpacity(opacity)
-        self._focus_dimmed_actor_state.clear()
+            self._focus_dimmed_base_names.discard(base_name)
 
     def _camera_pose_iso(self):
         return (1.0, 1.0, 1.0), (0.0, 1.0, 0.0)
@@ -1051,7 +1543,9 @@ class VTKWidget(QWidget):
         direction = tuple(float(value) for value in direction) if direction else None
         view_up = tuple(float(value) for value in (view_up or (0.0, 1.0, 0.0)))
 
-        use_direction = position is None or self._points_are_close(position, focal_point)
+        use_direction = position is None or self._points_are_close(
+            position, focal_point
+        )
         if use_direction:
             if direction is None:
                 return False
@@ -1066,6 +1560,9 @@ class VTKWidget(QWidget):
                 focal_point[1] + direction[1] * distance,
                 focal_point[2] + direction[2] * distance,
             )
+
+        if position is None:
+            return False
 
         camera.SetViewAngle(self.CAMERA_VIEW_ANGLE_DEG)
         camera.SetFocalPoint(*focal_point)
@@ -1083,7 +1580,9 @@ class VTKWidget(QWidget):
         return all(abs(a - b) <= epsilon for a, b in zip(point_a, point_b))
 
     def _reset_camera_to_direction(self, direction, view_up, scene_bounds=None):
-        bounds = scene_bounds if scene_bounds is not None else self._get_scene_model_bounds()
+        bounds = (
+            scene_bounds if scene_bounds is not None else self._get_scene_model_bounds()
+        )
         if bounds is None:
             self.renderer.ResetCamera()
             return
@@ -1470,7 +1969,7 @@ class VTKWidget(QWidget):
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(silhouette.GetOutputPort())
-        mapper._highlight_pipeline_refs = pipeline_refs
+        setattr(mapper, "_highlight_pipeline_refs", pipeline_refs)
         if hasattr(mapper, "SetStatic"):
             mapper.SetStatic(False)
         return mapper
