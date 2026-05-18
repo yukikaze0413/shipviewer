@@ -101,7 +101,7 @@
   },
   {
     "model_name": "ROOT",
-    "display_name": "整车层级",
+    "display_name": "整船层级",
     "damage_leaf_id": "ROOT",
     "image_path": "images/devices/root.png",
     "material": "待补充",
