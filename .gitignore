@@ -21,6 +21,7 @@ Thumbs.db
 
 # Optional external water texture assets
 assets/water/*
+assets/cache/*
 !assets/water/README.txt
 
 # bat files

@@ -2,12 +2,33 @@
 模型加载器
 支持 .3dm (Rhino) 和 .glb (glTF Binary) 格式
 """
+import hashlib
+import json
 import os
 import sys
 import vtk
 from PySide6.QtCore import QThread, Signal
 
 GLB_COMPOSITE_MAPPER_THRESHOLD = 300
+MODEL_CACHE_VERSION = 1
+
+
+def app_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def model_cache_root():
+    return os.path.normpath(os.path.join(app_base_dir(), "assets", "cache", "models"))
+
+
+def model_cache_key(filepath):
+    abs_path = os.path.normcase(os.path.abspath(filepath))
+    digest = hashlib.sha256(abs_path.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    safe_stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
+    return f"{safe_stem}-{digest}"
 
 
 class ModelLoadThread(QThread):
@@ -22,6 +43,7 @@ class ModelLoadThread(QThread):
         self.filepath = filepath
         self._current_model_dir = ""
         self._object_index_by_id = {}
+        self.force_rebuild_cache = False
 
     def run(self):
         try:
@@ -62,8 +84,206 @@ class ModelLoadThread(QThread):
         finally:
             self.completed.emit()
 
+    def _load_3dm_cache(self, filepath):
+        self.progress.emit(12, "正在检查 3DM 模型缓存...")
+        for cache_dir in self._cache_candidate_dirs(filepath):
+            try:
+                metadata_path = os.path.join(cache_dir, "metadata.json")
+                geometry_path = os.path.join(cache_dir, "geometry.vtm")
+                if not os.path.exists(metadata_path) or not os.path.exists(geometry_path):
+                    continue
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+                if not self._cache_metadata_matches(metadata, filepath):
+                    continue
+                self.progress.emit(18, "正在读取 3DM 缓存几何...")
+                actors = self._actors_from_3dm_cache(metadata, geometry_path)
+                if actors:
+                    return actors
+            except Exception:
+                continue
+        return []
+
+    def _write_3dm_cache(self, filepath, actors):
+        try:
+            cache_dir = self._cache_dir_for_path(filepath)
+            os.makedirs(cache_dir, exist_ok=True)
+            geometry_path = os.path.join(cache_dir, "geometry.vtm")
+            metadata_path = os.path.join(cache_dir, "metadata.json")
+
+            multiblock = vtk.vtkMultiBlockDataSet()
+            multiblock.SetNumberOfBlocks(len(actors))
+            entries = []
+            for block_index, item in enumerate(actors):
+                actor = item.get("actor")
+                mapper = actor.GetMapper() if actor is not None else None
+                data_obj = mapper.GetInputDataObject(0, 0) if mapper is not None else None
+                if data_obj is None:
+                    continue
+                multiblock.SetBlock(block_index, data_obj)
+                entries.append(self._cache_entry_for_actor_item(item, block_index))
+
+            if not entries:
+                return False
+
+            writer = vtk.vtkXMLMultiBlockDataWriter()
+            writer.SetFileName(geometry_path)
+            writer.SetInputData(multiblock)
+            writer.SetDataModeToBinary()
+            if not writer.Write():
+                return False
+
+            metadata = self._source_file_metadata(filepath, include_hash=True)
+            metadata.update(
+                {
+                    "cache_version": MODEL_CACHE_VERSION,
+                    "entry_count": len(entries),
+                    "geometry_file": "geometry.vtm",
+                    "entries": entries,
+                }
+            )
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def _actors_from_3dm_cache(self, metadata, geometry_path):
+        reader = vtk.vtkXMLMultiBlockDataReader()
+        reader.SetFileName(geometry_path)
+        reader.Update()
+        multiblock = reader.GetOutput()
+        if multiblock is None:
+            return []
+
+        self.progress.emit(35, "正在从缓存重建场景对象...")
+        actors = []
+        for entry in metadata.get("entries", []):
+            block_index = int(entry.get("block_index", len(actors)))
+            data_obj = multiblock.GetBlock(block_index)
+            if data_obj is None:
+                continue
+
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputData(data_obj)
+            self._configure_mapper_for_static_scene(mapper)
+
+            actor = vtk.vtkActor()
+            actor.SetMapper(mapper)
+            texture = self._texture_for_path(entry.get("texture_path", ""))
+            self._configure_actor_material(
+                actor,
+                self._metadata_color(entry.get("color")),
+                texture,
+            )
+
+            actors.append(
+                {
+                    "actor": actor,
+                    "name": str(entry.get("name", "")),
+                    "base_name": str(entry.get("base_name", "")),
+                    "is_split": bool(entry.get("is_split", False)),
+                    "type": str(entry.get("type", "Mesh")),
+                    "points": int(entry.get("points", data_obj.GetNumberOfPoints())),
+                    "cells": int(entry.get("cells", data_obj.GetNumberOfCells())),
+                    "texture_path": str(entry.get("texture_path", "")),
+                }
+            )
+        return actors
+
+    def _cache_entry_for_actor_item(self, item, block_index):
+        actor = item.get("actor")
+        prop = actor.GetProperty() if actor is not None else None
+        color = prop.GetColor() if prop is not None else (0.72, 0.74, 0.78)
+        return {
+            "block_index": block_index,
+            "name": str(item.get("name", "")),
+            "base_name": str(item.get("base_name", "")),
+            "is_split": bool(item.get("is_split", False)),
+            "type": str(item.get("type", "Mesh")),
+            "points": int(item.get("points", 0)),
+            "cells": int(item.get("cells", 0)),
+            "color": [float(color[0]), float(color[1]), float(color[2])],
+            "texture_path": str(item.get("texture_path", "")),
+        }
+
+    def _cache_metadata_matches(self, metadata, filepath):
+        if int(metadata.get("cache_version", -1)) != MODEL_CACHE_VERSION:
+            return False
+
+        current = self._source_file_metadata(filepath)
+        if int(metadata.get("source_size", -1)) != current["source_size"]:
+            return False
+
+        cached_norm = os.path.normcase(os.path.abspath(str(metadata.get("source_path", ""))))
+        current_norm = os.path.normcase(os.path.abspath(filepath))
+        path_matches = cached_norm == current_norm or str(
+            metadata.get("source_basename", "")
+        ).casefold() == current["source_basename"].casefold()
+        if not path_matches:
+            return False
+
+        if int(metadata.get("source_mtime_ns", -1)) == current["source_mtime_ns"]:
+            return True
+
+        cached_hash = str(metadata.get("source_sha256", ""))
+        return bool(cached_hash) and cached_hash == self._file_sha256(filepath)
+
+    def _source_file_metadata(self, filepath, include_hash=False):
+        stat = os.stat(filepath)
+        abs_path = os.path.normpath(os.path.abspath(filepath))
+        metadata = {
+            "source_path": abs_path,
+            "source_norm_path": os.path.normcase(abs_path),
+            "source_basename": os.path.basename(filepath),
+            "source_size": int(stat.st_size),
+            "source_mtime_ns": int(stat.st_mtime_ns),
+        }
+        if include_hash:
+            metadata["source_sha256"] = self._file_sha256(filepath)
+        return metadata
+
+    def _file_sha256(self, filepath):
+        digest = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _cache_dir_for_path(self, filepath):
+        return os.path.join(model_cache_root(), model_cache_key(filepath))
+
+    def _cache_candidate_dirs(self, filepath):
+        exact_dir = self._cache_dir_for_path(filepath)
+        candidates = [exact_dir]
+        root = model_cache_root()
+        if os.path.isdir(root):
+            for name in os.listdir(root):
+                candidate = os.path.join(root, name)
+                if os.path.isdir(candidate) and candidate not in candidates:
+                    candidates.append(candidate)
+        return candidates
+
+    def _metadata_color(self, value, default=(0.72, 0.74, 0.78)):
+        if not isinstance(value, (list, tuple)) or len(value) < 3:
+            return default
+        try:
+            return (
+                self._clamp_color_channel(value[0]),
+                self._clamp_color_channel(value[1]),
+                self._clamp_color_channel(value[2]),
+            )
+        except (TypeError, ValueError):
+            return default
+
     def _load_3dm(self, filepath):
         """加载 Rhino .3dm 文件"""
+        if not self.force_rebuild_cache:
+            cached_actors = self._load_3dm_cache(filepath)
+            if cached_actors:
+                self.progress.emit(100, "已从 3DM 模型缓存加载")
+                return cached_actors
+
         try:
             import rhino3dm
         except ImportError as exc:
@@ -118,6 +338,9 @@ class ModelLoadThread(QThread):
             )
             actors.extend(entries)
 
+        if not self.isInterruptionRequested() and actors:
+            self._write_3dm_cache(filepath, actors)
+
         self.progress.emit(100, "加载完成")
         return actors
 
@@ -153,7 +376,8 @@ class ModelLoadThread(QThread):
         color = self._rhino_object_color(
             rhino3dm, model, attr, material, object_index, fallback_colors
         )
-        texture = self._rhino_material_texture(material)
+        texture_path = self._rhino_material_texture_path(material) if material else ""
+        texture = self._texture_for_path(texture_path)
         entries = []
         meshes = self._rhino_geometry_to_meshes(rhino3dm, geo, transform)
         is_split = len(meshes) > 1
@@ -173,6 +397,7 @@ class ModelLoadThread(QThread):
                     "type": geo_type,
                     "points": points,
                     "cells": cells,
+                    "texture_path": texture_path,
                 }
             )
 
@@ -424,7 +649,13 @@ class ModelLoadThread(QThread):
         if material is None:
             return None
         texture_path = self._rhino_material_texture_path(material)
+        return self._texture_for_path(texture_path)
+
+    def _texture_for_path(self, texture_path):
         if not texture_path:
+            return None
+        texture_path = os.path.normpath(str(texture_path))
+        if not os.path.exists(texture_path):
             return None
         reader = self._texture_reader_for_path(texture_path)
         if reader is None:
