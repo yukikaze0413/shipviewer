@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QLabel,
     QVBoxLayout,
     QHBoxLayout,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QScrollArea,
     QFrame,
+    QToolTip,
 )
 from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QPixmap, QFont
@@ -62,11 +64,14 @@ class MainWindow(QMainWindow):
         # 状态
         self._current_file = None
         self._load_thread = None
+        self._is_closing = False
         self._gltf_importer = None
+        self._load_progress_dialog = None
         self._loaded_items = []
         self._is_wireframe = False
         self._project_root = app_base_dir()
         self._assets_root = app_path("assets")
+        self._default_model_dir = app_path("assets", "model")
         self._damage_tree_csv_path = self._resolve_data_file(
             ("assets", "csv", "damage-tree-nodes.csv"),
             "damage-tree-nodes.csv",
@@ -74,6 +79,10 @@ class MainWindow(QMainWindow):
         self._device_catalog_json_path = self._resolve_data_file(
             ("assets", "json", "device-catalog.json"),
             "device-catalog.json",
+        )
+        self._device_abstract_json_path = self._resolve_data_file(
+            ("assets", "json", "abstract.json"),
+            "abstract.json",
         )
         self._damage_camera_poses_path = self._resolve_data_file(
             ("assets", "json", "damage-camera-poses.json"),
@@ -90,6 +99,7 @@ class MainWindow(QMainWindow):
         self._device_catalog_rows = []
         self._device_catalog_by_model_name = defaultdict(list)
         self._device_catalog_by_damage_leaf_id = defaultdict(list)
+        self._device_abstract_by_model_name = {}
         self._damage_nodes_by_id = {}
         self._damage_children_by_id = defaultdict(list)
         self._damage_node_ids = set()
@@ -106,11 +116,13 @@ class MainWindow(QMainWindow):
         self._create_properties_dock()
         self._create_status_bar()
         self._load_device_catalog_from_json()
+        self._load_device_abstracts_from_json()
         self._load_damage_tree_from_csv()
         self._load_damage_camera_poses()
 
         # 信号连接
         self.vtk_widget.model_clicked.connect(self._on_vtk_model_clicked)
+        self.vtk_widget.model_hovered.connect(self._on_vtk_model_hovered)
 
         # 初始化VTK（延迟到窗口显示后）
         QTimer.singleShot(100, self._init_vtk)
@@ -400,14 +412,14 @@ class MainWindow(QMainWindow):
 
     def _create_properties_dock(self):
         """创建信息展示停靠窗口"""
+        panel_width = 320
         self.props_dock = QDockWidget("信息展示", self)
-        self.props_dock.setMinimumWidth(220)
+        self.props_dock.setFixedWidth(panel_width)
         self.props_dock.setFeatures(
             QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable
         )
 
         props_container = QWidget()
-        props_container.setMinimumWidth(0)
         props_layout = QVBoxLayout(props_container)
         props_layout.setContentsMargins(0, 0, 0, 0)
         props_layout.setSpacing(0)
@@ -438,9 +450,7 @@ class MainWindow(QMainWindow):
         self.document_status_label.setWordWrap(True)
 
         self.document_view = QStackedWidget()
-        self.document_view.setMinimumWidth(0)
         self.document_message_view = QLabel("未选择设备")
-        self.document_message_view.setMinimumWidth(0)
         self.document_message_view.setAlignment(Qt.AlignCenter)
         self.document_message_view.setWordWrap(True)
         self.document_view.addWidget(self.document_message_view)
@@ -485,9 +495,36 @@ class MainWindow(QMainWindow):
             self._water_texture_path if os.path.exists(self._water_texture_path) else ""
         )
         self.vtk_widget.set_scene_metadata("", 0)
+        self._load_default_startup_model()
+
+    def _load_default_startup_model(self):
+        default_model_path = self._default_startup_model_path()
+        if default_model_path:
+            self._load_model(default_model_path)
+            return
+
+        self.status_label.setText("未找到默认模型: assets/model/*.3dm")
+
+    def _default_startup_model_path(self):
+        if not os.path.isdir(self._default_model_dir):
+            return ""
+
+        model_paths = [
+            os.path.join(self._default_model_dir, filename)
+            for filename in os.listdir(self._default_model_dir)
+            if filename.lower().endswith(".3dm")
+            and os.path.isfile(os.path.join(self._default_model_dir, filename))
+        ]
+        if not model_paths:
+            return ""
+
+        return os.path.normpath(
+            sorted(model_paths, key=lambda path: os.path.basename(path).casefold())[0]
+        )
 
     def _reload_damage_tree(self):
         self._load_device_catalog_from_json()
+        self._load_device_abstracts_from_json()
         self._load_damage_tree_from_csv()
         self._load_damage_camera_poses()
 
@@ -495,7 +532,7 @@ class MainWindow(QMainWindow):
         detail_scroll = QScrollArea()
         detail_scroll.setWidgetResizable(True)
         detail_scroll.setFrameShape(QFrame.NoFrame)
-        detail_scroll.setMinimumWidth(0)
+        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         detail_widget = QWidget()
         detail_layout = QVBoxLayout(detail_widget)
@@ -598,6 +635,48 @@ class MainWindow(QMainWindow):
                     "row_number": idx,
                 }
             )
+        return rows
+
+    def _load_device_abstracts_from_json(self, json_path=None):
+        json_path = json_path or self._device_abstract_json_path
+        self._device_abstract_by_model_name = {}
+
+        if not os.path.exists(json_path):
+            return
+
+        try:
+            self._device_abstract_by_model_name = self._read_device_abstract_rows(
+                json_path
+            )
+        except Exception as exc:
+            self._set_document_message(f"\u8bfb\u53d6\u8bbe\u5907\u7b80\u4ecb\u5931\u8d25: {exc}")
+
+    def _read_device_abstract_rows(self, json_path):
+        with open(json_path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError("abstract.json must be keyed by model_name.")
+
+        rows = {}
+        for model_name, item in data.items():
+            model_name = str(model_name or "").strip()
+            if not model_name:
+                continue
+
+            if isinstance(item, dict):
+                display_name = str(item.get("display_name", "")).strip()
+                abstract = str(
+                    item.get("abstract") or item.get("description") or ""
+                ).strip()
+            else:
+                display_name = ""
+                abstract = str(item or "").strip()
+
+            rows[model_name] = {
+                "display_name": display_name,
+                "abstract": abstract,
+            }
         return rows
 
     def _resolve_device_image_path(self, image_path):
@@ -850,9 +929,8 @@ class MainWindow(QMainWindow):
             return
 
         self._current_file = filepath
-        self.status_label.setText(f"正在加载: {os.path.basename(filepath)}")
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
+        self._show_load_progress_dialog(filepath)
+        self._set_load_progress(0, f"正在加载: {os.path.basename(filepath)}")
 
         # 更新文件信息
         self._update_file_info(filepath)
@@ -864,16 +942,110 @@ class MainWindow(QMainWindow):
 
         self._start_model_load_thread(filepath)
 
+    def _show_load_progress_dialog(self, filepath):
+        self._hide_load_progress_dialog()
+        dialog = QProgressDialog("准备导入模型...", "", 0, 100, self)
+        dialog.setWindowTitle("模型导入")
+        dialog.setWindowModality(Qt.ApplicationModal)
+        dialog.setWindowFlag(Qt.WindowCloseButtonHint, False)
+        dialog.setCancelButton(None)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+        dialog.setFixedSize(480, 180)
+        dialog.setValue(0)
+        dialog.setLabelText(f"准备导入: {os.path.basename(filepath)}")
+
+        progress_bar = dialog.findChild(QProgressBar)
+        if progress_bar is not None:
+            progress_bar.setTextVisible(True)
+            progress_bar.setFormat("%p%")
+            progress_bar.setFixedHeight(30)
+            progress_bar.setStyleSheet(
+                """
+                QProgressBar {
+                    min-height: 30px;
+                    max-height: 30px;
+                    border-radius: 6px;
+                    text-align: center;
+                    font-size: 10pt;
+                    font-weight: bold;
+                }
+                QProgressBar::chunk {
+                    border-radius: 6px;
+                }
+                """
+            )
+
+        self._load_progress_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _set_load_progress(self, percent, description):
+        percent = max(0, min(100, int(percent)))
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(percent)
+        self.status_label.setText(description)
+
+        if self._load_progress_dialog is not None:
+            self._load_progress_dialog.setValue(percent)
+            self._load_progress_dialog.setLabelText(description)
+
+    def _hide_load_progress_dialog(self):
+        if self._load_progress_dialog is None:
+            return
+        self._load_progress_dialog.close()
+        self._load_progress_dialog.deleteLater()
+        self._load_progress_dialog = None
+
     def _start_model_load_thread(self, filepath, status_text=None):
         """启动后台加载线程，避免模型解析阻塞 UI 事件循环。"""
         self._gltf_importer = None
         if status_text:
-            self.status_label.setText(status_text)
+            self._set_load_progress(self.progress_bar.value(), status_text)
         self._load_thread = ModelLoadThread(filepath)
         self._load_thread.progress.connect(self._on_load_progress)
         self._load_thread.finished.connect(self._on_load_finished)
         self._load_thread.error.connect(self._on_load_error)
+        self._load_thread.completed.connect(self._on_load_thread_completed)
         self._load_thread.start()
+
+    def _on_load_thread_completed(self):
+        thread = self.sender()
+        if thread is None:
+            return
+
+        self._release_load_thread(thread)
+
+    def _release_load_thread(self, thread):
+        if self._load_thread is thread:
+            self._load_thread = None
+
+        if getattr(thread, "_delete_later_scheduled", False):
+            return
+        thread._delete_later_scheduled = True
+        thread.deleteLater()
+
+    def _stop_load_thread_for_close(self):
+        thread = self._load_thread
+        if thread is None:
+            return
+
+        if not thread.isRunning():
+            self._release_load_thread(thread)
+            return
+
+        thread.requestInterruption()
+        self._hide_load_progress_dialog()
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("正在停止模型加载...")
+
+        if not thread.wait(3000):
+            self.status_label.setText("正在等待模型加载线程结束...")
+            thread.wait()
+
+        self._release_load_thread(thread)
 
     def _should_load_gltf_in_thread(self, filepath):
         """大 glTF/GLB 使用 reader 线程路径，避免 importer 在主线程长时间阻塞。"""
@@ -911,8 +1083,7 @@ class MainWindow(QMainWindow):
     def _load_gltf_with_importer(self, filepath):
         """用 vtkGLTFImporter 加载，保留完整材质/贴图。"""
         try:
-            self.progress_bar.setValue(20)
-            self.status_label.setText("正在导入 glTF 场景（保留材质）...")
+            self._set_load_progress(20, "正在导入 glTF 场景（保留材质）...")
 
             self.vtk_widget.clear_scene()
             self.vtk_widget.set_scene_metadata(filepath, 0)
@@ -926,8 +1097,7 @@ class MainWindow(QMainWindow):
             importer.Update()
             self._gltf_importer = importer
 
-            self.progress_bar.setValue(60)
-            self.status_label.setText("正在优化贴图质量...")
+            self._set_load_progress(60, "正在优化贴图质量...")
 
             gltf_name_entries = self._read_gltf_renderable_name_entries(
                 filepath,
@@ -1011,12 +1181,17 @@ class MainWindow(QMainWindow):
                 render=False, scene_bounds=scene_bounds
             )
             self.vtk_widget.reset_camera(scene_bounds=scene_bounds)
-            self.progress_bar.setVisible(False)
 
             if object_count == 0:
+                self.progress_bar.setVisible(False)
+                self._hide_load_progress_dialog()
                 self.status_label.setText("加载失败")
                 QMessageBox.warning(self, "提示", "未从 glTF 中导入到可渲染对象。")
                 return
+
+            self._set_load_progress(100, "加载完成")
+            self.progress_bar.setVisible(False)
+            self._hide_load_progress_dialog()
 
             if textured_count == 0:
                 self.status_label.setText(
@@ -1034,6 +1209,7 @@ class MainWindow(QMainWindow):
             self._update_geo_info_all(total_verts, total_faces, object_count)
         except Exception as e:
             self.progress_bar.setVisible(False)
+            self._hide_load_progress_dialog()
             self.status_label.setText("加载失败")
             QMessageBox.critical(self, "加载错误", f"贴图加载失败: {str(e)}")
 
@@ -1387,11 +1563,15 @@ class MainWindow(QMainWindow):
 
     def _on_load_progress(self, percent, description):
         """加载进度回调"""
-        self.progress_bar.setValue(percent)
-        self.status_label.setText(description)
+        if self._is_closing:
+            return
+        self._set_load_progress(percent, description)
 
     def _on_load_finished(self, actors, message):
         """加载完成回调"""
+        if self._is_closing:
+            return
+        self._set_load_progress(95, "正在显示模型...")
         self.progress_bar.setVisible(False)
 
         # 清空旧场景
@@ -1466,12 +1646,23 @@ class MainWindow(QMainWindow):
         self.vtk_widget.set_scene_metadata(self._current_file or "", object_count)
         self.vtk_widget.rebuild_performance_stats()
         self._update_geo_info_all(total_verts, total_faces, object_count)
+        self._set_load_progress(100, "加载完成")
+        self.progress_bar.setVisible(False)
+        self._hide_load_progress_dialog()
 
     def _on_load_error(self, error_msg):
         """加载错误回调"""
+        if self._is_closing:
+            return
         self.progress_bar.setVisible(False)
+        self._hide_load_progress_dialog()
         self.status_label.setText("加载失败")
         QMessageBox.critical(self, "加载错误", error_msg)
+
+    def closeEvent(self, event):
+        self._is_closing = True
+        self._stop_load_thread_for_close()
+        super().closeEvent(event)
 
     def _on_vtk_model_clicked(self, actor_name):
         """VTK视口模型点击事件"""
@@ -1493,6 +1684,7 @@ class MainWindow(QMainWindow):
         # 高亮
         self.vtk_widget.clear_selection_focus()
         self.vtk_widget.highlight_actor(actor_name)
+        self.vtk_widget.set_rotation_focus_to_selection([actor_name])
         self._set_highlight_debug(self.vtk_widget.highlighted_names())
         info = self.vtk_widget.get_actor_info(actor_name)
         if info:
@@ -1514,6 +1706,21 @@ class MainWindow(QMainWindow):
             meta="  |  ".join(meta_parts),
         )
 
+    def _on_vtk_model_hovered(self, actor_name, global_pos):
+        if not actor_name or global_pos is None:
+            QToolTip.hideText()
+            return
+
+        if actor_name not in self.vtk_widget.highlighted_names():
+            QToolTip.hideText()
+            return
+
+        QToolTip.showText(
+            global_pos,
+            self._hover_tooltip_text_for_actor(actor_name),
+            self.vtk_widget,
+        )
+
     def _on_tree_item_clicked(self, item, column):
         """树节点点击事件"""
         node_id = self._normalize_damage_id(item.data(0, self.DAMAGE_NODE_ID_ROLE))
@@ -1533,8 +1740,11 @@ class MainWindow(QMainWindow):
                 matches = self._damage_display_matches([], object_matches)
             highlighted_names = self._selection_names_for_catalog_rows(object_matches)
             self.vtk_widget.highlight_actors(highlighted_names)
-            self.vtk_widget.focus_selection(highlighted_names)
-            self._apply_damage_camera_pose(node_id)
+            if self._apply_damage_camera_pose(node_id):
+                self.vtk_widget.set_selection_focus_dim(highlighted_names, render=True)
+                self.vtk_widget.set_rotation_focus_to_selection(highlighted_names)
+            else:
+                self.vtk_widget.focus_selection(highlighted_names)
             self._set_highlight_debug(self.vtk_widget.highlighted_names())
 
             highlight_text = (
@@ -1748,11 +1958,58 @@ class MainWindow(QMainWindow):
 
     def _display_name_for_actor(self, actor_name):
         catalog_key = self._catalog_key_for_actor(actor_name)
+        abstract_row = self._device_abstract_by_model_name.get(catalog_key)
+        if abstract_row:
+            display_name = abstract_row.get("display_name")
+            if display_name:
+                return display_name
         for row in self._device_catalog_by_model_name.get(catalog_key, []):
             display_name = row.get("display_name")
             if display_name:
                 return display_name
         return self._actor_display_names.get(actor_name) or actor_name
+
+    def _device_abstract_for_actor(self, actor_name):
+        candidates = (
+            self._catalog_key_for_actor(actor_name),
+            self._actor_catalog_names.get(actor_name, ""),
+            self._actor_display_names.get(actor_name, ""),
+            actor_name,
+        )
+        for candidate in candidates:
+            if candidate in self._device_abstract_by_model_name:
+                return self._device_abstract_by_model_name[candidate]
+
+        normalized_candidates = {
+            self._normalize_catalog_match_text(candidate)
+            for candidate in candidates
+            if candidate
+        }
+        for row in self._device_catalog_rows:
+            model_name = row.get("model_name", "")
+            row_candidates = (
+                model_name,
+                row.get("display_name", ""),
+                row.get("damage_leaf_id", ""),
+            )
+            if any(
+                self._normalize_catalog_match_text(candidate)
+                in normalized_candidates
+                for candidate in row_candidates
+                if candidate
+            ):
+                abstract_row = self._device_abstract_by_model_name.get(model_name)
+                if abstract_row:
+                    return abstract_row
+        return None
+
+    def _hover_tooltip_text_for_actor(self, actor_name):
+        abstract_row = self._device_abstract_for_actor(actor_name) or {}
+        title = abstract_row.get("display_name") or self._display_name_for_actor(
+            actor_name
+        )
+        abstract = abstract_row.get("abstract") or "\u6682\u65e0\u7b80\u4ecb"
+        return f"{title}\n{abstract}"
 
     def _best_catalog_name(self, *candidates):
         fallback = ""
@@ -1921,6 +2178,7 @@ class MainWindow(QMainWindow):
 
     def clear_scene(self):
         """清空场景"""
+        QToolTip.hideText()
         self.vtk_widget.clear_scene()
         self.vtk_widget.set_scene_metadata("", 0)
         self._gltf_importer = None

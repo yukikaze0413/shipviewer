@@ -59,6 +59,23 @@ class RemappedQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
         if parent is not None and hasattr(parent, "_handle_viewport_left_click"):
             parent._handle_viewport_left_click()
 
+    def _dispatch_hover_pick(self, ev):
+        parent = self._viewport_parent()
+        if parent is not None and hasattr(parent, "_handle_viewport_hover"):
+            parent._handle_viewport_hover(self._event_global_pos(ev))
+
+    def _dispatch_hover_leave(self):
+        parent = self._viewport_parent()
+        if parent is not None and hasattr(parent, "_handle_viewport_hover_leave"):
+            parent._handle_viewport_hover_leave()
+
+    def _event_global_pos(self, ev):
+        if hasattr(ev, "globalPosition"):
+            return ev.globalPosition().toPoint()
+        if hasattr(ev, "globalPos"):
+            return ev.globalPos()
+        return None
+
     def _dispatch_wheel_step(self, direction):
         parent = self._viewport_parent()
         if parent is not None and hasattr(parent, "_handle_viewport_wheel"):
@@ -124,6 +141,20 @@ class RemappedQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
 
         super().mouseReleaseEvent(ev)
 
+    def mouseMoveEvent(self, ev):
+        self._set_interactor_event_info(ev)
+        if ev.buttons() == Qt.MouseButton.NoButton:
+            self._dispatch_hover_pick(ev)
+            super().mouseMoveEvent(ev)
+        else:
+            self._dispatch_hover_leave()
+            self._Iren.MouseMoveEvent()
+        ev.accept()
+
+    def leaveEvent(self, ev):
+        self._dispatch_hover_leave()
+        super().leaveEvent(ev)
+
     def wheelEvent(self, ev):
         self._set_interactor_event_info(ev)
         angle_delta, pixel_delta, legacy_delta = self._wheel_event_delta(ev)
@@ -151,12 +182,13 @@ class VTKWidget(QWidget):
     CAMERA_MAX_DISTANCE = 750.0
     CAMERA_FRAME_PADDING = 1.08
     FOCUS_FRAME_PADDING = 1.28
-    FOCUS_DIM_OPACITY = 0.08
+    FOCUS_DIM_OPACITY = 0.15
     WATER_DEFAULT_SIZE = 180.0
     WATER_TILE_SIZE = 24.0
 
     # 信号
     model_clicked = Signal(str)
+    model_hovered = Signal(str, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -174,6 +206,7 @@ class VTKWidget(QWidget):
         self._actor_sphere = {}  # base_name -> (cx, cy, cz, radius)
         self._selected_actor_name = None
         self._selected_actor_names = []
+        self._hovered_highlight_name = ""
         self._highlight_overlay_actors = {}
         self._background_image_reader = None
         self._background_texture = None
@@ -223,10 +256,12 @@ class VTKWidget(QWidget):
         self._setup_vtk()
 
     def _setup_ui(self):
+        self.setMouseTracking(True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         self.vtk_widget = RemappedQVTKRenderWindowInteractor(self)
+        self.vtk_widget.setMouseTracking(True)
         layout.addWidget(self.vtk_widget)
 
     def _setup_vtk(self):
@@ -1041,11 +1076,73 @@ class VTKWidget(QWidget):
                 return self._selection_name_for_pick(base_name)
         return ""
 
+    def _pick_highlighted_actor_name_at_event_position(self):
+        if not self._selected_actor_names:
+            return ""
+
+        highlighted_base_names = []
+        seen = set()
+        for selected_name in self._selected_actor_names:
+            target = self._selection_targets.get(selected_name)
+            if not target:
+                continue
+            base_name = target[0]
+            if base_name in seen or base_name not in self._actors:
+                continue
+            highlighted_base_names.append(base_name)
+            seen.add(base_name)
+
+        if not highlighted_base_names:
+            return ""
+
+        click_pos = self._current_interactor_event_position()
+        self.picker.InitializePickList()
+        for base_name in highlighted_base_names:
+            self.picker.AddPickList(self._actors[base_name])
+        self.picker.PickFromListOn()
+        try:
+            self.picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
+            actor = self.picker.GetActor()
+            if actor:
+                actor_ptr = getattr(actor, "__this__", "")
+                base_name = self._actor_name_by_ptr.get(actor_ptr, "")
+                if base_name:
+                    return self._selection_name_for_pick(base_name)
+            return ""
+        finally:
+            self.picker.PickFromListOff()
+            self.picker.InitializePickList()
+
     def _emit_model_clicked(self, clicked_name):
         self.model_clicked.emit(clicked_name)
 
+    def _emit_model_hovered(self, hovered_name, global_pos=None):
+        self.model_hovered.emit(hovered_name, global_pos)
+
+    def _clear_highlight_hover(self):
+        if not self._hovered_highlight_name:
+            return
+        self._hovered_highlight_name = ""
+        self._emit_model_hovered("", None)
+
     def _handle_viewport_left_click(self):
         self._emit_model_clicked(self._pick_actor_name_at_event_position())
+
+    def _handle_viewport_hover(self, global_pos=None):
+        if not self._selected_actor_names:
+            self._clear_highlight_hover()
+            return
+
+        hovered_name = self._pick_highlighted_actor_name_at_event_position()
+        if hovered_name not in self._selected_actor_names:
+            self._clear_highlight_hover()
+            return
+
+        self._hovered_highlight_name = hovered_name
+        self._emit_model_hovered(hovered_name, global_pos)
+
+    def _handle_viewport_hover_leave(self):
+        self._clear_highlight_hover()
 
     def _zoom_factor(self):
         return 1.2
@@ -1353,6 +1450,7 @@ class VTKWidget(QWidget):
             self._remove_selection_entries_for_base(name)
 
     def clear_scene(self):
+        self._clear_highlight_hover()
         self.clear_selection_focus()
         for selected_name in self._selected_actor_names:
             self._clear_highlight(selected_name)
@@ -1386,6 +1484,7 @@ class VTKWidget(QWidget):
         self.highlight_actors([name] if name else [])
 
     def highlight_actors(self, names):
+        self._clear_highlight_hover()
         for selected_name in self._selected_actor_names:
             self._clear_highlight(selected_name)
 
@@ -1420,6 +1519,65 @@ class VTKWidget(QWidget):
 
         self._apply_selection_focus_dim(selected_bases)
         self._frame_bounds_from_best_view(bounds, padding=self.FOCUS_FRAME_PADDING)
+        self.render_window.Render()
+        return True
+
+    def set_selection_focus_dim(self, names, render=False):
+        unique_names = self._valid_selection_names(names)
+        if not unique_names:
+            self.clear_selection_focus(render=render)
+            return False
+
+        selected_bases = self._base_names_for_selection(unique_names)
+        if not selected_bases:
+            self.clear_selection_focus(render=render)
+            return False
+
+        self._apply_selection_focus_dim(selected_bases)
+        if render:
+            self.render_window.Render()
+        return True
+
+    def set_rotation_focus_to_selection(self, names):
+        unique_names = self._valid_selection_names(names)
+        if not unique_names:
+            return False
+
+        bounds = self._bounds_for_selection(unique_names)
+        if bounds is None:
+            return False
+
+        center, _ = self._bounds_center_radius(bounds)
+        return self.set_rotation_focus(center)
+
+    def set_rotation_focus(self, focal_point):
+        if focal_point is None:
+            return False
+
+        camera = self.renderer.GetActiveCamera()
+        if camera is None:
+            return False
+
+        focal_point = tuple(float(value) for value in focal_point)
+        current_focal_point = camera.GetFocalPoint()
+        current_position = camera.GetPosition()
+        delta = (
+            focal_point[0] - current_focal_point[0],
+            focal_point[1] - current_focal_point[1],
+            focal_point[2] - current_focal_point[2],
+        )
+
+        camera.SetFocalPoint(*focal_point)
+        camera.SetPosition(
+            current_position[0] + delta[0],
+            current_position[1] + delta[1],
+            current_position[2] + delta[2],
+        )
+        scene_bounds = self._get_scene_model_bounds()
+        if scene_bounds is None:
+            self.renderer.ResetCameraClippingRange()
+        else:
+            self.renderer.ResetCameraClippingRange(scene_bounds)
         self.render_window.Render()
         return True
 
@@ -1841,12 +1999,6 @@ class VTKWidget(QWidget):
         self._base_to_flat_alias.pop(base_name, None)
         self._base_to_dataset_alias.pop(base_name, None)
 
-    def _set_block_color(self, actor, flat_index, color):
-        mapper = actor.GetMapper()
-        if mapper and hasattr(mapper, "SetBlockColor"):
-            mapper.SetBlockColor(flat_index, *color)
-            mapper.Modified()
-
     def _apply_highlight(self, selection_name):
         target = self._selection_targets.get(selection_name)
         if not target:
@@ -1866,7 +2018,9 @@ class VTKWidget(QWidget):
             actor.GetProperty().SetEdgeOpacity(1.0)
             actor.GetProperty().SetLineWidth(1.5)
             return
-        self._set_block_color(actor, flat_index, (1.0, 0.60, 0.0))
+        # Do not recolor composite sub-blocks as a fallback: SetBlockColor can
+        # override the original material/texture and make the highlighted device
+        # look like it lost its material.
 
     def _clear_highlight(self, selection_name):
         overlay_actor = self._highlight_overlay_actors.pop(selection_name, None)
@@ -1883,13 +2037,7 @@ class VTKWidget(QWidget):
             return
         if flat_index is None:
             actor.GetProperty().SetEdgeVisibility(False)
-            base_color = self._actor_base_color.get(base_name)
-            if base_color:
-                actor.GetProperty().SetColor(*base_color)
             return
-        base_color = self._selection_base_color.get(selection_name)
-        if base_color:
-            self._set_block_color(actor, flat_index, base_color)
 
     def _remove_all_highlight_overlays(self):
         for overlay_actor in self._highlight_overlay_actors.values():

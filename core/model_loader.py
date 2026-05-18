@@ -15,6 +15,7 @@ class ModelLoadThread(QThread):
     finished = Signal(object, str)    # (actors_list, message)
     progress = Signal(int, str)       # (percent, description)
     error = Signal(str)               # error message
+    completed = Signal()              # emitted whenever run() exits
 
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
@@ -35,10 +36,15 @@ class ModelLoadThread(QThread):
                 self.error.emit(f"不支持的文件格式: {ext}")
                 return
 
+            if self.isInterruptionRequested():
+                return
+
             if actors:
                 self.finished.emit(actors, f"成功加载 {len(actors)} 个对象")
             else:
                 diagnostics = getattr(self, "_last_3dm_diagnostics", [])
+                if self.isInterruptionRequested():
+                    return
                 if ext == ".3dm" and diagnostics:
                     preview = "\n".join(diagnostics[:12])
                     extra = "" if len(diagnostics) <= 12 else f"\n... 另有 {len(diagnostics) - 12} 项"
@@ -51,7 +57,10 @@ class ModelLoadThread(QThread):
                     return
                 self.error.emit("未能从文件中提取任何几何体")
         except Exception as e:
-            self.error.emit(f"加载失败: {str(e)}")
+            if not self.isInterruptionRequested():
+                self.error.emit(f"加载失败: {str(e)}")
+        finally:
+            self.completed.emit()
 
     def _load_3dm(self, filepath):
         """加载 Rhino .3dm 文件"""
@@ -94,6 +103,9 @@ class ModelLoadThread(QThread):
         ]
 
         for i, obj in enumerate(model.Objects):
+            if self.isInterruptionRequested():
+                return actors
+
             percent = 20 + int(70 * (i + 1) / total)
             self.progress.emit(percent, f"正在处理对象 {i + 1}/{total}...")
 

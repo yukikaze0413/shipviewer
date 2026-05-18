@@ -72,11 +72,13 @@ ShipViewer external assets
 Editable files are stored in the assets folder next to ShipViewer.exe:
 - assets\csv\damage-tree-nodes.csv
 - assets\json\device-catalog.json
+- assets\json\abstract.json
 - assets\images\devices\*.png, *.jpg, *.jpeg
 - assets\backgrounds\*.hdr
 - assets\water\water_diffuse.jpg, water_diffuse.png, or material.png
 
 Device highlighting and detail data are read from assets\json\device-catalog.json.
+Highlighted-object hover summaries are read from assets\json\abstract.json.
 Water textures are optional. If no water texture is found, ShipViewer uses
 a simple translucent water surface.
 HDR backgrounds are scanned from assets/backgrounds. Use background.hdr for

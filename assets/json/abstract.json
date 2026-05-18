@@ -1,0 +1,70 @@
+{
+  "Object_47": {
+    "display_name": "车窗",
+    "abstract": "用于观察外部环境并提供驾驶舱采光与基础防护。"
+  },
+  "Object_32": {
+    "display_name": "车框",
+    "abstract": "支撑车窗结构，承担固定玻璃和连接车身的作用。"
+  },
+  "Object_26": {
+    "display_name": "侧窗",
+    "abstract": "提供侧向视野，辅助观察舰体或车辆侧方状态。"
+  },
+  "Object_36": {
+    "display_name": "后窗",
+    "abstract": "提供后向观察视野，便于检查后方环境。"
+  },
+  "Object_130": {
+    "display_name": "车灯",
+    "abstract": "用于照明和信号提示，在低光环境下提升识别度。"
+  },
+  "Object_64": {
+    "display_name": "车标",
+    "abstract": "用于标识设备或平台归属，便于快速识别。"
+  },
+  "Object_12": {
+    "display_name": "右前轮胎",
+    "abstract": "承载前部重量并提供行驶、转向和缓冲能力。"
+  },
+  "Object_9": {
+    "display_name": "右后轮胎",
+    "abstract": "承载后部重量并提供行驶稳定性和地面附着力。"
+  },
+  "Object_89": {
+    "display_name": "左前轮胎",
+    "abstract": "承载前部重量并配合转向结构，提供左前侧支撑。"
+  },
+  "Object_118": {
+    "display_name": "左后轮胎",
+    "abstract": "承载后部重量并保持左后侧行驶稳定性。"
+  },
+  "ROOT": {
+    "display_name": "整船层级",
+    "abstract": "用于表示整体验证或总览场景的层级节点。"
+  },
+  "BODY": {
+    "display_name": "车身外观层级",
+    "abstract": "包含主体外观结构，用于整体外形检查。"
+  },
+  "WINDOW_SYSTEM": {
+    "display_name": "车窗系统层级",
+    "abstract": "包含车窗及相关框架，用于观察和防护区域检查。"
+  },
+  "LIGHT_SYSTEM": {
+    "display_name": "灯光系统层级",
+    "abstract": "包含照明与信号部件，用于低光和提示功能检查。"
+  },
+  "BRAND_SYSTEM": {
+    "display_name": "品牌标识层级",
+    "abstract": "包含标识类部件，用于归属和识别信息检查。"
+  },
+  "WHEEL_SYSTEM": {
+    "display_name": "轮胎系统层级",
+    "abstract": "包含轮胎相关部件，用于承载、行驶和稳定性检查。"
+  },
+  "对象_381": {
+    "display_name": "yepian",
+    "abstract": "测试用叶片部件简介，用于验证中文对象名的悬停显示。"
+  }
+}

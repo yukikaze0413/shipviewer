@@ -97,3 +97,28 @@ damage-tree-nodes.csv 的 节点ID  <->  device-catalog.json 的 damage_leaf_id
   "function": "待补充"
 }
 ```
+
+## Hover summaries: `abstract.json`
+
+When a model object is highlighted, hovering the mouse over that highlighted
+object reads the short tooltip text from `assets/json/abstract.json`.
+
+`abstract.json` is keyed by the model object's `model_name`. The key must match
+the same model name used by `device-catalog.json`.
+
+```json
+{
+  "Object_47（模型的名称）": {
+    "display_name": "设备名称",
+    "abstract": "这里填写鼠标悬停时显示的一句简介。"
+  }
+}
+```
+
+Fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `display_name` | No | Device name shown in the hover tooltip. If empty, the program falls back to `device-catalog.json` and then the model display name. |
+| `abstract` | No | Short hover description. If empty or missing, the tooltip shows `暂无简介`. |
+| `description` | No | Optional alias for `abstract`. |
