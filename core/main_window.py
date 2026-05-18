@@ -247,6 +247,14 @@ class MainWindow(QMainWindow):
         self.action_camera_debug.toggled.connect(self._set_camera_debug_overlay_visible)
         view_menu.addAction(self.action_camera_debug)
 
+        self.action_performance_overlay = QAction("Show Performance Overlay", self)
+        self.action_performance_overlay.setCheckable(True)
+        self.action_performance_overlay.setChecked(False)
+        self.action_performance_overlay.toggled.connect(
+            self._set_performance_overlay_visible
+        )
+        view_menu.addAction(self.action_performance_overlay)
+
         # === 窗口菜单 ===
         window_menu = menubar.addMenu("窗口(&W)")
         self.action_show_tree = QAction("损伤树", self)
@@ -323,6 +331,19 @@ class MainWindow(QMainWindow):
         self.btn_camera_debug.toggled.connect(self._set_camera_debug_overlay_visible)
         toolbar.addAction(self.btn_camera_debug)
 
+        self.btn_performance = QAction("📊 性能", self)
+        self.btn_performance.setCheckable(True)
+        self.btn_performance.setToolTip("Toggle the upper-left performance overlay")
+        self.btn_performance.toggled.connect(self._set_performance_overlay_visible)
+        toolbar.addAction(self.btn_performance)
+
+        self.btn_dynamic_hide = QAction("🫥 动隐", self)
+        self.btn_dynamic_hide.setCheckable(True)
+        self.btn_dynamic_hide.setChecked(True)
+        self.btn_dynamic_hide.setToolTip("移动时自动隐藏小物体")
+        self.btn_dynamic_hide.toggled.connect(self._set_dynamic_hide_enabled)
+        toolbar.addAction(self.btn_dynamic_hide)
+
         toolbar.addSeparator()
 
         # 截图
@@ -359,15 +380,13 @@ class MainWindow(QMainWindow):
         self.model_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.model_tree.setAllColumnsShowFocus(True)
         # Keep selection color continuous across branch/text areas and hide dark branch lines.
-        self.model_tree.setStyleSheet(
-            """
+        self.model_tree.setStyleSheet("""
             QTreeView { show-decoration-selected: 1; }
             QTreeView::branch:has-siblings:!adjoins-item { border-image: none; }
             QTreeView::branch:has-siblings:adjoins-item { border-image: none; }
             QTreeView::branch:!has-children:!has-siblings:adjoins-item { border-image: none; }
             QTreeWidget::item { margin: 0px; border-radius: 0px; }
-            """
-        )
+            """)
         self.model_tree.itemClicked.connect(self._on_tree_item_clicked)
         self.model_tree.setColumnWidth(0, 220)
         tree_layout.addWidget(self.model_tree)
@@ -463,10 +482,9 @@ class MainWindow(QMainWindow):
         if os.path.exists(self._viewport_background_path):
             self.vtk_widget.set_background_image(self._viewport_background_path)
         self.vtk_widget.set_water_surface(
-            self._water_texture_path
-            if os.path.exists(self._water_texture_path)
-            else ""
+            self._water_texture_path if os.path.exists(self._water_texture_path) else ""
         )
+        self.vtk_widget.set_scene_metadata("", 0)
 
     def _reload_damage_tree(self):
         self._load_device_catalog_from_json()
@@ -599,7 +617,9 @@ class MainWindow(QMainWindow):
         candidates = [
             os.path.join(self._assets_root, raw_path),
             os.path.join(self._project_root, raw_path),
-            os.path.join(self._assets_root, "images", "devices", os.path.basename(raw_path)),
+            os.path.join(
+                self._assets_root, "images", "devices", os.path.basename(raw_path)
+            ),
         ]
         for candidate in candidates:
             candidate = os.path.normpath(candidate)
@@ -895,6 +915,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("正在导入 glTF 场景（保留材质）...")
 
             self.vtk_widget.clear_scene()
+            self.vtk_widget.set_scene_metadata(filepath, 0)
             self._loaded_items = []
             self._actor_catalog_names.clear()
             self._actor_display_names.clear()
@@ -1008,6 +1029,8 @@ class MainWindow(QMainWindow):
             self.vertex_label.setText(
                 f"顶点: {total_verts:,}  |  面片: {total_faces:,}  |  对象: {object_count}"
             )
+            self.vtk_widget.set_scene_metadata(filepath, object_count)
+            self.vtk_widget.rebuild_performance_stats()
             self._update_geo_info_all(total_verts, total_faces, object_count)
         except Exception as e:
             self.progress_bar.setVisible(False)
@@ -1150,10 +1173,7 @@ class MainWindow(QMainWindow):
         if sub_items:
             display_names = self._match_gltf_display_names(
                 name_entries,
-                [
-                    (sub.get("points", 0), sub.get("cells", 0))
-                    for sub in sub_items
-                ],
+                [(sub.get("points", 0), sub.get("cells", 0)) for sub in sub_items],
             )
             for sub_item, display_name in zip(sub_items, display_names):
                 if display_name:
@@ -1376,6 +1396,7 @@ class MainWindow(QMainWindow):
 
         # 清空旧场景
         self.vtk_widget.clear_scene()
+        self.vtk_widget.set_scene_metadata(self._current_file or "", 0)
         self._apply_gltf_names_to_threaded_items(actors)
         self._loaded_items = actors
         self._actor_catalog_names.clear()
@@ -1442,6 +1463,8 @@ class MainWindow(QMainWindow):
         )
 
         # 更新几何信息表
+        self.vtk_widget.set_scene_metadata(self._current_file or "", object_count)
+        self.vtk_widget.rebuild_performance_stats()
         self._update_geo_info_all(total_verts, total_faces, object_count)
 
     def _on_load_error(self, error_msg):
@@ -1622,7 +1645,8 @@ class MainWindow(QMainWindow):
         return [
             row
             for row in self._device_catalog_rows
-            if self._normalize_damage_id(row.get("model_name", "")) == normalized_node_id
+            if self._normalize_damage_id(row.get("model_name", ""))
+            == normalized_node_id
             if self._is_damage_node_catalog_row(row)
         ]
 
@@ -1630,7 +1654,9 @@ class MainWindow(QMainWindow):
         rows = []
         for damage_id in damage_ids:
             normalized_damage_id = self._normalize_damage_id(damage_id)
-            for row in self._device_catalog_by_damage_leaf_id.get(normalized_damage_id, []):
+            for row in self._device_catalog_by_damage_leaf_id.get(
+                normalized_damage_id, []
+            ):
                 if self._is_damage_node_catalog_row(row):
                     continue
                 rows.append(row)
@@ -1788,9 +1814,7 @@ class MainWindow(QMainWindow):
             self._show_device_detail(device_row, display_name)
             return
 
-        self._set_document_message(
-            f"未找到设备详情: {lookup_label} = {source_key}"
-        )
+        self._set_document_message(f"未找到设备详情: {lookup_label} = {source_key}")
 
     def _on_catalog_row_clicked(self, row, column):
         self._display_catalog_row(row)
@@ -1821,7 +1845,9 @@ class MainWindow(QMainWindow):
 
     def _device_detail_for_catalog_row(self, catalog_row):
         model_name = catalog_row.get("model_name", "")
-        damage_leaf_id = self._normalize_damage_id(catalog_row.get("damage_leaf_id", ""))
+        damage_leaf_id = self._normalize_damage_id(
+            catalog_row.get("damage_leaf_id", "")
+        )
 
         rows = self._device_catalog_by_model_name.get(model_name, [])
         if rows:
@@ -1896,6 +1922,7 @@ class MainWindow(QMainWindow):
     def clear_scene(self):
         """清空场景"""
         self.vtk_widget.clear_scene()
+        self.vtk_widget.set_scene_metadata("", 0)
         self._gltf_importer = None
         self._loaded_items = []
         self._actor_catalog_names.clear()
@@ -1951,6 +1978,23 @@ class MainWindow(QMainWindow):
         self.btn_camera_debug.setChecked(checked)
         self.action_camera_debug.blockSignals(False)
         self.btn_camera_debug.blockSignals(False)
+
+    def _set_performance_overlay_visible(self, checked):
+        """Keep menu / toolbar / VTK performance overlay state in sync."""
+        self.vtk_widget.set_performance_overlay_visible(checked)
+
+        self.action_performance_overlay.blockSignals(True)
+        self.btn_performance.blockSignals(True)
+        self.action_performance_overlay.setChecked(checked)
+        self.btn_performance.setChecked(checked)
+        self.action_performance_overlay.blockSignals(False)
+        self.btn_performance.blockSignals(False)
+
+    def _set_dynamic_hide_enabled(self, checked):
+        self.vtk_widget.set_dynamic_hide_enabled(checked)
+        self.btn_dynamic_hide.blockSignals(True)
+        self.btn_dynamic_hide.setChecked(checked)
+        self.btn_dynamic_hide.blockSignals(False)
 
     def _actor_has_any_texture(self, actor):
         if actor is None:
