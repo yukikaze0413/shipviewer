@@ -175,6 +175,7 @@ class VTKWidget(QWidget):
     """基于VTK的3D视口组件 - 极致性能优化版 (针对百万面级模型)"""
 
     LOD_POINT_THRESHOLD = 200_000
+    ENABLE_LOD_ACTOR = False
     DYNAMIC_HIDE_MIN_ACTOR_COUNT = 800
     DYNAMIC_HIDE_MAX_ANGULAR_SIZE_RAD = 0.01
     DYNAMIC_HIDE_MAX_CELLS = 40_000
@@ -201,6 +202,7 @@ class VTKWidget(QWidget):
         )  # sel_name -> (base_name, flat_block_index or None)
         self._selection_geometry = {}  # sel_name -> (points, cells)
         self._selection_base_color = {}  # sel_name -> (r, g, b)
+        self._selection_world_bounds = {}  # sel_name -> world-space bounds
         self._base_to_flat_alias = {}  # base_name -> {flat_block_index: sel_name}
         self._base_to_dataset_alias = {}  # base_name -> {dataset_ptr: sel_name}
         self._actor_sphere = {}  # base_name -> (cx, cy, cz, radius)
@@ -208,6 +210,7 @@ class VTKWidget(QWidget):
         self._selected_actor_names = []
         self._hovered_highlight_name = ""
         self._highlight_overlay_actors = {}
+        self._highlight_actor_prop_state = {}
         self._background_image_reader = None
         self._background_texture = None
         self._skybox_actor = None
@@ -1347,7 +1350,8 @@ class VTKWidget(QWidget):
         data_obj = mapper.GetInputDataObject(0, 0) if mapper else None
         has_texture = self._actor_has_any_texture(actor)
         use_lod = (
-            add_to_renderer
+            self.ENABLE_LOD_ACTOR
+            and add_to_renderer
             and mapper is not None
             and data_obj is not None
             and not has_texture
@@ -1380,6 +1384,9 @@ class VTKWidget(QWidget):
         self._selection_targets[name] = (name, None)
         self._selection_geometry[name] = self._actor_geometry[name]
         self._selection_base_color[name] = self._actor_base_color[name]
+        bounds = render_actor.GetBounds()
+        if self._valid_bounds(bounds):
+            self._selection_world_bounds[name] = tuple(float(value) for value in bounds)
         self._performance_snapshot = {}
         self._performance_snapshot_time = 0.0
         if add_to_renderer:
@@ -1393,14 +1400,20 @@ class VTKWidget(QWidget):
         points=0,
         cells=0,
         base_color=None,
+        world_bounds=None,
         dataset_ptr="",
     ):
         if base_name not in self._actors:
             return
         self._selection_targets[alias_name] = (base_name, flat_block_index)
         self._selection_geometry[alias_name] = (points, cells)
-        if base_color is not None:
-            self._selection_base_color[alias_name] = tuple(base_color)
+        self._selection_base_color[alias_name] = (
+            tuple(base_color) if base_color is not None else None
+        )
+        if self._valid_bounds(world_bounds):
+            self._selection_world_bounds[alias_name] = tuple(
+                float(value) for value in world_bounds
+            )
         self._base_to_flat_alias.setdefault(base_name, {})[
             flat_block_index
         ] = alias_name
@@ -1443,6 +1456,7 @@ class VTKWidget(QWidget):
             self._actor_geometry.pop(name, None)
             self._actor_sphere.pop(name, None)
             self._actor_base_color.pop(name, None)
+            self._highlight_actor_prop_state.pop(name, None)
             self._dynamic_hidden_actor_names.discard(name)
             self._invisible_actor_count = len(self._dynamic_hidden_actor_names)
             self._performance_snapshot = {}
@@ -1465,6 +1479,7 @@ class VTKWidget(QWidget):
         self._selection_targets.clear()
         self._selection_geometry.clear()
         self._selection_base_color.clear()
+        self._selection_world_bounds.clear()
         self._base_to_flat_alias.clear()
         self._base_to_dataset_alias.clear()
         self._dynamic_hidden_actor_names.clear()
@@ -1476,6 +1491,7 @@ class VTKWidget(QWidget):
         self._selected_actor_name = None
         self._selected_actor_names = []
         self._highlight_overlay_actors.clear()
+        self._highlight_actor_prop_state.clear()
         self._performance_snapshot = {}
         self._performance_snapshot_time = 0.0
         self.update_water_surface_to_scene(render=False)
@@ -1504,6 +1520,14 @@ class VTKWidget(QWidget):
 
     def highlighted_names(self):
         return list(self._selected_actor_names)
+
+    def selection_center(self, name):
+        bounds = self._bounds_for_selection([name])
+        if bounds is None:
+            return None
+
+        center, _ = self._bounds_center_radius(bounds)
+        return center
 
     def focus_selection(self, names):
         unique_names = self._valid_selection_names(names)
@@ -1726,7 +1750,6 @@ class VTKWidget(QWidget):
         camera.SetFocalPoint(*focal_point)
         camera.SetPosition(*position)
         camera.SetViewUp(*view_up)
-        camera.SetRoll(0.0)
         if clipping_bounds is None:
             self.renderer.ResetCameraClippingRange()
         else:
@@ -1872,13 +1895,17 @@ class VTKWidget(QWidget):
             if actor is None:
                 continue
 
-            bounds = self._bounds_for_selection_target(actor, flat_index)
+            bounds = self._bounds_for_selection_target(name, actor, flat_index)
             if self._valid_bounds(bounds):
                 selection_bounds.append(bounds)
 
         return self._union_bounds(selection_bounds)
 
-    def _bounds_for_selection_target(self, actor, flat_index):
+    def _bounds_for_selection_target(self, selection_name, actor, flat_index):
+        cached_bounds = self._selection_world_bounds.get(selection_name)
+        if self._valid_bounds(cached_bounds):
+            return cached_bounds
+
         data_obj = self._highlight_data_object(actor, flat_index)
         if data_obj is not None:
             try:
@@ -1996,6 +2023,7 @@ class VTKWidget(QWidget):
             self._selection_targets.pop(key, None)
             self._selection_geometry.pop(key, None)
             self._selection_base_color.pop(key, None)
+            self._selection_world_bounds.pop(key, None)
         self._base_to_flat_alias.pop(base_name, None)
         self._base_to_dataset_alias.pop(base_name, None)
 
@@ -2007,12 +2035,14 @@ class VTKWidget(QWidget):
         actor = self._actors.get(base_name)
         if actor is None:
             return
+        self._restore_selection_block_color(selection_name)
         overlay_actor = self._create_highlight_overlay_actor(actor, flat_index)
         if overlay_actor is not None:
             self._highlight_overlay_actors[selection_name] = overlay_actor
             self.renderer.AddActor(overlay_actor)
             return
         if flat_index is None:
+            self._save_actor_highlight_prop_state(base_name, actor)
             actor.GetProperty().SetEdgeVisibility(True)
             actor.GetProperty().SetEdgeColor(1.0, 0.6, 0.0)
             actor.GetProperty().SetEdgeOpacity(1.0)
@@ -2036,13 +2066,56 @@ class VTKWidget(QWidget):
         if actor is None:
             return
         if flat_index is None:
-            actor.GetProperty().SetEdgeVisibility(False)
+            self._restore_actor_highlight_prop_state(base_name, actor)
             return
+        self._restore_selection_block_color(selection_name)
 
     def _remove_all_highlight_overlays(self):
         for overlay_actor in self._highlight_overlay_actors.values():
             self.renderer.RemoveActor(overlay_actor)
         self._highlight_overlay_actors.clear()
+
+    def _save_actor_highlight_prop_state(self, base_name, actor):
+        if base_name in self._highlight_actor_prop_state:
+            return
+        prop = actor.GetProperty()
+        self._highlight_actor_prop_state[base_name] = {
+            "edge_visibility": prop.GetEdgeVisibility(),
+            "edge_color": tuple(prop.GetEdgeColor()),
+            "edge_opacity": prop.GetEdgeOpacity(),
+            "line_width": prop.GetLineWidth(),
+        }
+
+    def _restore_actor_highlight_prop_state(self, base_name, actor):
+        state = self._highlight_actor_prop_state.pop(base_name, None)
+        if state is None:
+            return
+        prop = actor.GetProperty()
+        prop.SetEdgeVisibility(state["edge_visibility"])
+        prop.SetEdgeColor(*state["edge_color"])
+        prop.SetEdgeOpacity(state["edge_opacity"])
+        prop.SetLineWidth(state["line_width"])
+
+    def _restore_selection_block_color(self, selection_name):
+        target = self._selection_targets.get(selection_name)
+        if not target:
+            return
+        base_name, flat_index = target
+        if flat_index is None:
+            return
+        actor = self._actors.get(base_name)
+        mapper = actor.GetMapper() if actor is not None else None
+        color = self._selection_base_color.get(selection_name)
+        if mapper is None:
+            return
+        if color is None:
+            remove_block_color = getattr(mapper, "RemoveBlockColor", None)
+            if callable(remove_block_color):
+                remove_block_color(flat_index)
+            return
+        if not hasattr(mapper, "SetBlockColor"):
+            return
+        mapper.SetBlockColor(flat_index, *color)
 
     def _create_highlight_overlay_actor(self, actor, flat_index):
         data_obj = self._highlight_data_object(actor, flat_index)
@@ -2117,6 +2190,7 @@ class VTKWidget(QWidget):
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(silhouette.GetOutputPort())
+        mapper.ScalarVisibilityOff()
         setattr(mapper, "_highlight_pipeline_refs", pipeline_refs)
         if hasattr(mapper, "SetStatic"):
             mapper.SetStatic(False)

@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QFrame,
     QToolTip,
+    QSizePolicy,
 )
 from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QPixmap, QFont
@@ -412,7 +413,11 @@ class MainWindow(QMainWindow):
 
     def _create_properties_dock(self):
         """创建信息展示停靠窗口"""
-        panel_width = 320
+        panel_width = 340
+        content_width = panel_width - 16
+        self._props_panel_width = panel_width
+        self._props_content_width = content_width
+        self._device_detail_margins = (18, 18, 18, 18)
         self.props_dock = QDockWidget("信息展示", self)
         self.props_dock.setFixedWidth(panel_width)
         self.props_dock.setFeatures(
@@ -421,7 +426,7 @@ class MainWindow(QMainWindow):
 
         props_container = QWidget()
         props_layout = QVBoxLayout(props_container)
-        props_layout.setContentsMargins(0, 0, 0, 0)
+        props_layout.setContentsMargins(0, 0, 8, 0)
         props_layout.setSpacing(0)
 
         # These widgets keep the selection state for existing update logic, but are not
@@ -457,6 +462,7 @@ class MainWindow(QMainWindow):
 
         self._create_device_detail_view()
 
+        self.document_view.setFixedWidth(content_width)
         self.document_view.setMinimumHeight(260)
         props_layout.addWidget(self.document_view, 1)
 
@@ -533,10 +539,11 @@ class MainWindow(QMainWindow):
         detail_scroll.setWidgetResizable(True)
         detail_scroll.setFrameShape(QFrame.NoFrame)
         detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        detail_scroll.setFixedWidth(self._props_content_width)
 
         detail_widget = QWidget()
         detail_layout = QVBoxLayout(detail_widget)
-        detail_layout.setContentsMargins(18, 18, 18, 18)
+        detail_layout.setContentsMargins(*self._device_detail_margins)
         detail_layout.setSpacing(14)
 
         self.device_title_label = QLabel("未选择设备")
@@ -566,6 +573,8 @@ class MainWindow(QMainWindow):
         ):
             value_label = QLabel("待补充")
             value_label.setWordWrap(True)
+            value_label.setMinimumWidth(0)
+            value_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             self.device_field_labels[field_key] = value_label
             detail_form.addRow(f"{field_name}:", value_label)
@@ -1618,6 +1627,7 @@ class MainWindow(QMainWindow):
                         points=sub.get("points", 0),
                         cells=sub.get("cells", 0),
                         base_color=sub.get("color"),
+                        world_bounds=sub.get("bounds"),
                         dataset_ptr=sub.get("dataset_ptr", ""),
                     )
             else:
@@ -1742,7 +1752,6 @@ class MainWindow(QMainWindow):
             self.vtk_widget.highlight_actors(highlighted_names)
             if self._apply_damage_camera_pose(node_id):
                 self.vtk_widget.set_selection_focus_dim(highlighted_names, render=True)
-                self.vtk_widget.set_rotation_focus_to_selection(highlighted_names)
             else:
                 self.vtk_widget.focus_selection(highlighted_names)
             self._set_highlight_debug(self.vtk_widget.highlighted_names())
@@ -2009,7 +2018,12 @@ class MainWindow(QMainWindow):
             actor_name
         )
         abstract = abstract_row.get("abstract") or "\u6682\u65e0\u7b80\u4ecb"
-        return f"{title}\n{abstract}"
+        center = self.vtk_widget.selection_center(actor_name)
+        if center is None:
+            center_text = "none"
+        else:
+            center_text = f"[{center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}]"
+        return f"{title}\n{abstract}\n\u4e2d\u5fc3\u5750\u6807 / focal_point: {center_text}"
 
     def _best_catalog_name(self, *candidates):
         fallback = ""
@@ -2154,9 +2168,13 @@ class MainWindow(QMainWindow):
             self.device_image_label.setText(f"设备图片无法读取:\n{image_path}")
             return
 
-        target_size = self.device_image_label.size()
+        left_margin, _, right_margin, _ = self._device_detail_margins
+        target_width = max(
+            1,
+            self._props_content_width - left_margin - right_margin - 2,
+        )
         scaled = pixmap.scaled(
-            max(target_size.width(), 240),
+            target_width,
             260,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,

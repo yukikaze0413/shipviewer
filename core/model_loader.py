@@ -834,16 +834,18 @@ class ModelLoadThread(QThread):
 
             sub_items = []
             for idx, block_info in enumerate(poly_blocks):
+                has_block_vertex_color = self._has_vertex_color(block_info["poly"])
                 color = self._extract_poly_base_color(block_info["poly"])
                 flat_index = block_info["flat_index"]
-                if not self._has_vertex_color(block_info["poly"]):
+                if not has_block_vertex_color:
                     mapper.SetBlockColor(flat_index, *color)
                 sub_items.append({
                     "name": block_info["name"],
                     "type": "Mesh",
                     "flat_index": flat_index,
                     "dataset_ptr": block_info["dataset_ptr"],
-                    "color": color,
+                    "color": color if not has_block_vertex_color else None,
+                    "bounds": tuple(block_info["poly"].GetBounds()),
                     "points": block_info["poly"].GetNumberOfPoints(),
                     "cells": block_info["poly"].GetNumberOfCells(),
                 })
