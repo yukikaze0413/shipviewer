@@ -161,22 +161,22 @@
   },
   {
     "model_name": "对象_381",
-    "display_name": "yepian",
-    "damage_leaf_id": "fan",
-    "image_path": "",
-    "material": "待补充",
-    "thickness": "待补充",
-    "size": "待补充",
-    "function": "待补充"
-  } ,
+    "display_name": "yepian 主叶片",
+    "damage_leaf_id": "YEPIAN",
+    "image_path": "images/devices/yepian.png",
+    "material": "玻璃钢复合材料，局部含金属连接件",
+    "thickness": "8 mm 主体层压板，根部加厚至 12 mm",
+    "size": "长约 780 mm，宽约 240 mm，单片回转半径约 390 mm",
+    "function": "作为旋转叶片单元提供导流、扰流或散热辅助效果，用于观察 yepian 部件的结构信息、材质参数和图像示例。"
+  },
   {
     "model_name": "对象_382",
-    "display_name": "yepian",
-    "damage_leaf_id": "fan",
-    "image_path": "",
-    "material": "待补充",
-    "thickness": "待补充",
-    "size": "待补充",
-    "function": "待补充"
+    "display_name": "yepian 副叶片",
+    "damage_leaf_id": "YEPIAN",
+    "image_path": "images/devices/yepian.png",
+    "material": "玻璃钢复合材料，边缘带耐磨涂层",
+    "thickness": "6 mm 叶身，根部安装区 10 mm",
+    "size": "长约 760 mm，宽约 220 mm，安装孔距约 96 mm",
+    "function": "作为与主叶片配套的副叶片，用于展示同类部件的实例数据，便于在详情面板中核对图片、尺寸和用途说明。"
   }
 ]
